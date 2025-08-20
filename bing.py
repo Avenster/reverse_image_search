@@ -234,7 +234,7 @@ def save_results(all_matches, filename="bing_matched_images.csv"):
 def main():
     parser = argparse.ArgumentParser(description="Bing Visual Search ORB Matcher")
     parser.add_argument('--images_folder', type=str, default='images', help='Folder containing images')
-    parser.add_argument('--output_file', type=str, default='bing_matched_images.csv', help='CSV file for output')
+    parser.add_argument('--output_file', type=str, default='bing_matches.csv', help='CSV file for output')
     parser.add_argument('--max_images', type=int, default=40, help='Max Bing result images to check')
     parser.add_argument('--max_workers', type=int, default=8, help='Max concurrent workers for matching')
     parser.add_argument('--batch_delay', type=float, default=2.0, help='Delay between images (seconds)')
