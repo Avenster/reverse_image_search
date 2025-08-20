@@ -4,822 +4,554 @@ import cv2
 import numpy as np
 import requests
 import os
-import json
-import re
-from bs4 import BeautifulSoup
+from pathlib import Path
+import glob
+from urllib.parse import unquote, urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from pathlib import Path
-import glob
-from urllib.parse import unquote, urlparse, parse_qs
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+from collections import defaultdict
 
-# -----------------------
-# Browser Setup
-# -----------------------
-def init_driver():
-    options = uc.ChromeOptions()
-    options.add_argument("--user-data-dir=/tmp/chrome-user-data")
-    options.add_argument("--profile-directory=Default")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--lang=en-US")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = uc.Chrome(options=options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    return driver
+# Configuration
+MAX_WORKERS = 5  # Parallel image checking
+WAIT_TIMEOUT = 15  # Increased timeout
+SHORT_WAIT = 1
+MEDIUM_WAIT = 3
+LONG_WAIT = 5
+ORB_FEATURES = 2000  # Reduced from 3000 for speed
+ORB_MIN_MATCHES = 10
+ORB_SIMILARITY_THRESHOLD = 0.01
 
-# -----------------------
-# Get Images from Folder
-# -----------------------
-def get_image_files(folder_path):
-    supported_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
-    image_files = []
-    folder_path = Path(folder_path)
+class YandexImageMatcher:
+    def __init__(self, images_folder='images', output_file='yandex_matched_images.csv'):
+        self.images_folder = Path(images_folder)
+        self.output_file = output_file
+        self.driver = None
+        self.orb = cv2.ORB_create(nfeatures=ORB_FEATURES, scaleFactor=1.2, nlevels=8)
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://yandex.com/',
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
     
-    if not folder_path.exists():
-        print(f"Error: Folder '{folder_path}' does not exist!")
-        return []
-    
-    for extension in supported_extensions:
-        image_files.extend(glob.glob(str(folder_path / extension)))
-        image_files.extend(glob.glob(str(folder_path / extension.upper())))
-    
-    return sorted(image_files)
-
-# -----------------------
-# Upload to Yandex and Navigate to Similar Images
-# -----------------------
-def upload_to_yandex(driver, image_path):
-    """
-    Upload image to Yandex starting from main page and navigate to similar images page
-    """
-    try:
-        # Go to main Yandex page
-        print("Loading Yandex main page...")
-        driver.get("https://yandex.com/")
-        time.sleep(3)
+    def init_driver(self):
+        """Initialize undetected Chrome driver"""
+        options = uc.ChromeOptions()
+        options.add_argument("--user-data-dir=/tmp/chrome-user-data")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-web-security")
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--window-size=1920,1080")
         
-        # Look for camera icon - try multiple approaches
-        camera_button = None
+        driver = uc.Chrome(options=options)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver.set_page_load_timeout(30)
+        return driver
+    
+    def get_image_files(self):
+        """Get all image files from folder"""
+        extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
+        files = []
         
-        # Method 1: Look for camera icon in search area
+        if not self.images_folder.exists():
+            raise FileNotFoundError(f"Folder '{self.images_folder}' not found")
+        
+        for ext in extensions:
+            files.extend(glob.glob(str(self.images_folder / ext)))
+            files.extend(glob.glob(str(self.images_folder / ext.upper())))
+        
+        return sorted(set(files))
+    
+    def wait_for_page_load(self):
+        """Wait for page to fully load"""
         try:
-            camera_button = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, ".search3__icon-camera, .search2__icon_camera, [data-testid='image-search'], .image-search__camera, .search__button_type_camera"))
+            WebDriverWait(self.driver, WAIT_TIMEOUT).until(
+                lambda driver: driver.execute_script("return document.readyState") == "complete"
             )
-            print("Found camera icon using standard selectors")
-        except:
-            pass
-        
-        # Method 2: Try clicking on Images link first, then camera
-        if not camera_button:
-            try:
-                # Click Images link
-                images_link = driver.find_element(By.LINK_TEXT, "Images")
-                images_link.click()
-                time.sleep(2)
-                
-                # Now look for camera
-                camera_button = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".search3__icon-camera, .search2__icon_camera, .CbirInput-SearchByImageButton, .input__search-by-image"))
-                )
-                print("Found camera icon after clicking Images link")
-            except:
-                pass
-        
-        # Method 3: Direct navigation to images page and find camera
-        if not camera_button:
-            try:
-                driver.get("https://yandex.com/images/")
-                time.sleep(3)
-                
-                camera_button = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".search3__icon-camera, .CbirInput-SearchByImageButton, .input__search-by-image, [aria-label*='Search by image']"))
-                )
-                print("Found camera icon on images page")
-            except:
-                pass
-        
-        # Method 4: JavaScript approach to find camera button
-        if not camera_button:
-            try:
-                camera_elements = driver.execute_script("""
-                    // Look for camera icons by various attributes
-                    var selectors = [
-                        '[data-testid*="camera"]',
-                        '[aria-label*="camera"]',
-                        '[aria-label*="image"]',
-                        '.search3__icon-camera',
-                        '.CbirInput-SearchByImageButton',
-                        '.input__search-by-image',
-                        '[title*="Search by image"]',
-                        '[title*="camera"]'
-                    ];
-                    
-                    for (var selector of selectors) {
-                        var elements = document.querySelectorAll(selector);
-                        if (elements.length > 0) {
-                            return elements[0];
-                        }
-                    }
-                    return null;
-                """)
-                
-                if camera_elements:
-                    camera_button = camera_elements
-                    print("Found camera icon using JavaScript search")
-            except:
-                pass
-        
-        if not camera_button:
-            print("ERROR: Could not find camera icon on Yandex")
-            return False
-        
-        # Click the camera button
+            time.sleep(SHORT_WAIT)
+        except TimeoutException:
+            print("  Page load timeout, continuing...")
+    
+    def upload_to_yandex(self, image_path):
+        """Upload image to Yandex and navigate to similar images"""
         try:
-            # Scroll to button and click
-            driver.execute_script("arguments[0].scrollIntoView(true);", camera_button)
-            time.sleep(1)
-            camera_button.click()
-            print("Clicked camera icon successfully")
-            time.sleep(2)
-        except:
-            # Try JavaScript click
-            driver.execute_script("arguments[0].click();", camera_button)
-            print("Clicked camera icon using JavaScript")
-            time.sleep(2)
-        
-        # Find file input and upload
-        print("Looking for file input...")
-        file_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='file']")
-        
-        file_input = None
-        for inp in file_inputs:
-            if inp.is_displayed() or True:  # Sometimes hidden but functional
-                file_input = inp
-                break
-        
-        if not file_input:
-            print("ERROR: Could not find file input")
-            return False
-        
-        # Upload the file
-        abs_path = os.path.abspath(image_path)
-        print(f"Uploading file: {abs_path}")
-        file_input.send_keys(abs_path)
-        
-        # Wait for upload and processing
-        print("Waiting for upload and initial processing...")
-        time.sleep(8)
-        
-        # Check if we're on a results page
-        current_url = driver.current_url
-        print(f"Current URL after upload: {current_url[:100]}...")
-        
-        # Look for "Show more similar images" or similar button
-        print("Looking for 'Show more similar images' button...")
-        time.sleep
-        
-        similar_button = None
-        
-        # Method 1: Look for specific button classes
-        try:
-            similar_button_selectors = [
-                "a.CbirSimilarList-MoreButton",
-                "a.Button.CbirSimilarList-MoreButton",
-                "a[href*='cbir_page=similar']",
-                ".CbirSimilarList-MoreButton",
-                ".Button_link.CbirSimilarList-MoreButton"
+            print(f"  Navigating to Yandex Images...")
+            # Navigate to Yandex Images
+            self.driver.get("https://yandex.com/images/")
+            self.wait_for_page_load()
+            
+            # Find and use the file input
+            wait = WebDriverWait(self.driver, WAIT_TIMEOUT)
+            
+            # Try multiple selectors for file input
+            file_input_selectors = [
+                "input[type='file']",
+                "input[accept*='image']",
+                ".input_type_file input",
+                ".CbirSearchForm-FileInput input"
             ]
             
-            for selector in similar_button_selectors:
+            file_input = None
+            for selector in file_input_selectors:
                 try:
-                    similar_button = driver.find_element(By.CSS_SELECTOR, selector)
-                    if similar_button.is_displayed():
-                        print(f"Found similar button with selector: {selector}")
-                        break
-                except:
+                    file_input = wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    break
+                except TimeoutException:
                     continue
-        except:
-            pass
-        
-        # Method 2: JavaScript search for buttons with relevant text
-        if not similar_button:
-            try:
-                similar_button = driver.execute_script("""
-                    var buttons = document.querySelectorAll('a, button');
-                    for (var i = 0; i < buttons.length; i++) {
-                        var text = buttons[i].textContent || buttons[i].innerText || '';
-                        var href = buttons[i].href || '';
-                        
-                        if (text.toLowerCase().includes('similar') || 
-                            text.toLowerCase().includes('show more') ||
-                            href.includes('cbir_page=similar')) {
-                            return buttons[i];
-                        }
-                    }
-                    return null;
-                """)
-                
-                if similar_button:
-                    print("Found similar button using JavaScript text search")
-            except:
-                pass
-        
-        # Method 3: Check if already on similar page or navigate manually
-        if not similar_button:
-            print("Could not find similar button, checking URL...")
             
-            # Check if we already have a cbir_id in URL
-            if "cbir_id=" in current_url:
-                if "cbir_page=similar" not in current_url:
-                    # Manually construct similar images URL
-                    if "?" in current_url:
-                        similar_url = current_url + "&cbir_page=similar"
+            if not file_input:
+                print("  Could not find file input")
+                return False
+            
+            # Make file input visible and upload
+            abs_path = os.path.abspath(image_path)
+            print(f"  Uploading: {os.path.basename(image_path)}")
+            
+            self.driver.execute_script("""
+                arguments[0].style.display = 'block';
+                arguments[0].style.visibility = 'visible';
+                arguments[0].style.opacity = '1';
+                arguments[0].style.position = 'static';
+            """, file_input)
+            
+            file_input.send_keys(abs_path)
+            
+            # Wait for upload and redirect
+            print("  Waiting for upload to complete...")
+            time.sleep(MEDIUM_WAIT)
+            
+            # Wait for the results page to load
+            try:
+                wait.until(
+                    EC.any_of(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, ".CbirNavigation-TabsItem")),
+                        EC.presence_of_element_located((By.CSS_SELECTOR, ".SerpItem")),
+                        EC.url_contains("cbir_id")
+                    )
+                )
+            except TimeoutException:
+                print("  Results page didn't load properly")
+                return False
+            
+            print("  Upload completed, looking for Similar Images tab...")
+            
+            # Now find and click the "Similar images" tab
+            similar_tab_selectors = [
+                "a[data-cbir-page-type='similar']",
+                ".CbirNavigation-TabsItem_name_similar-page",
+                "a.CbirNavigation-TabsItem_name_similar-page",
+                "//a[contains(text(), 'Similar') or contains(text(), 'Похожие')]"
+            ]
+            
+            similar_tab = None
+            for selector in similar_tab_selectors:
+                try:
+                    if selector.startswith("//"):
+                        # XPath selector
+                        similar_tab = wait.until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
                     else:
-                        similar_url = current_url + "?cbir_page=similar"
-                    
-                    print(f"Navigating to similar images page: {similar_url[:100]}...")
-                    driver.get(similar_url)
-                    time.sleep(5)
+                        # CSS selector
+                        similar_tab = wait.until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        )
+                    print(f"  Found similar tab with selector: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not similar_tab:
+                # Try to find by text content as fallback
+                try:
+                    similar_tab = wait.until(
+                        EC.element_to_be_clickable((By.XPATH, "//a[contains(@class, 'CbirNavigation-TabsItem') and (contains(text(), 'Similar') or contains(text(), 'Похожие') or contains(text(), 'похожие'))]"))
+                    )
+                    print("  Found similar tab by text content")
+                except TimeoutException:
+                    print("  Could not find Similar Images tab")
+                    return False
+            
+            # Click the similar images tab
+            try:
+                print("  Clicking Similar Images tab...")
+                
+                # Scroll tab into view
+                self.driver.execute_script("arguments[0].scrollIntoView(true);", similar_tab)
+                time.sleep(SHORT_WAIT)
+                
+                # Try clicking
+                try:
+                    similar_tab.click()
+                except ElementClickInterceptedException:
+                    # If regular click fails, try JavaScript click
+                    self.driver.execute_script("arguments[0].click();", similar_tab)
+                
+                # Wait for similar images page to load
+                time.sleep(MEDIUM_WAIT)
+                
+                # Verify we're on the similar images page
+                current_url = self.driver.current_url
+                if "cbir_page=similar" in current_url or "similar" in current_url.lower():
+                    print("  Successfully navigated to similar images")
                     return True
                 else:
-                    print("Already on similar images page")
+                    print(f"  URL doesn't contain similar page indicator: {current_url}")
+                    # Still try to continue as Yandex might have changed URL structure
                     return True
-            else:
-                print("ERROR: No cbir_id found in URL, upload may have failed")
-                return False
-        
-        # Click the similar button if found
-        
-        if similar_button:
-            try:
-                driver.execute_script("arguments[0].scrollIntoView(true);", similar_button)
-                time.sleep(1)
-                similar_button.click()
-                print("Clicked 'Show more similar images' button")
-                time.sleep(5)
-                return True
+                    
             except Exception as e:
-                print(f"Error clicking similar button: {str(e)}")
-                # Try JavaScript click
-                try:
-                    driver.execute_script("arguments[0].click();", similar_button)
-                    print("Clicked similar button using JavaScript")
-                    time.sleep(5)
-                    return True
-                except:
-                    print("Failed to click similar button")
-                    return False
-        
-        return False
+                print(f"  Error clicking similar tab: {str(e)}")
+                return False
             
-    except Exception as e:
-        print(f"Error during upload: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-# -----------------------
-# Extract Image URLs from Yandex Similar Images Page
-# -----------------------
-def get_yandex_image_urls(driver, max_images=50):
-    """
-    Extract image URLs from Yandex similar images results
-    """
-    urls = []
+        except Exception as e:
+            print(f"  Upload error: {str(e)}")
+            return False
     
-    try:
-        # Wait for content to load
-        time.sleep(3)
+    def extract_image_urls(self, max_images=50):
+        """Extract image URLs from results page"""
+        urls = set()
         
-        print("Current page URL:", driver.current_url[:100])
+        print("  Extracting image URLs...")
         
         # Scroll to load more images
-        print("Scrolling to load more images...")
-        last_height = driver.execute_script("return document.body.scrollHeight")
+        for i in range(5):
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(SHORT_WAIT)
         
-        for scroll_attempt in range(8):  # More scrolls for better coverage
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            new_height = driver.execute_script("return document.body.scrollHeight")
-            if new_height == last_height:
-                break
-            last_height = new_height
-            print(f"Scroll {scroll_attempt + 1}: New height = {new_height}")
+        # Wait a bit for images to load
+        time.sleep(MEDIUM_WAIT)
         
-        # Method 1: Extract from img_url parameters in links
-        print("Extracting URLs from link href attributes...")
-        
-        # Look for links with img_url parameter
-        links_with_img_url = driver.execute_script("""
-            var links = document.querySelectorAll('a[href*="img_url="]');
-            var urls = [];
+        # Extract URLs using multiple methods
+        extracted_urls = self.driver.execute_script("""
+            var urls = new Set();
             
-            for (var i = 0; i < links.length; i++) {
-                var href = links[i].href;
-                var match = href.match(/img_url=([^&]+)/);
-                if (match) {
-                    try {
-                        var decoded = decodeURIComponent(match[1]);
-                        if (decoded.startsWith('http')) {
-                            urls.push(decoded);
-                        }
-                    } catch (e) {
-                        // Skip invalid URLs
-                    }
-                }
-            }
-            return urls;
-        """)
-        
-        if links_with_img_url:
-            urls.extend(links_with_img_url)
-            print(f"Found {len(links_with_img_url)} URLs from img_url parameters")
-        
-        # Method 2: Look for image elements and their parent links
-        print("Looking for image elements...")
-        
-        image_selectors = [
-            "img.ImagesContentImage-Image",
-            ".SerpItem img",
-            ".JustifierRowLayout-Item img",
-            ".ImagesView-Content img",
-            ".serp-item img",
-            ".thumb img"
-        ]
-        
-        for selector in image_selectors:
-            try:
-                img_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-                print(f"Found {len(img_elements)} images with selector: {selector}")
-                
-                for img in img_elements[:max_images]:
-                    try:
-                        # Try to get parent link with img_url
-                        parent_link = img.find_element(By.XPATH, "./ancestor::a[@href]")
-                        if parent_link:
-                            href = parent_link.get_attribute('href')
-                            if 'img_url=' in href:
-                                parsed = urlparse(href)
-                                params = parse_qs(parsed.query)
-                                if 'img_url' in params:
-                                    img_url = unquote(params['img_url'][0])
-                                    if img_url.startswith('http') and img_url not in urls:
-                                        urls.append(img_url)
-                    except:
-                        # Try getting direct src if no parent link
-                        try:
-                            src = img.get_attribute('src')
-                            if src and src.startswith('http') and 'yandex' not in src and src not in urls:
-                                urls.append(src)
-                        except:
-                            pass
-            except:
-                continue
-        
-        # Method 3: Look for data attributes and onclick handlers
-        print("Looking for data attributes...")
-        
-        data_urls = driver.execute_script("""
-            var urls = [];
-            var elements = document.querySelectorAll('[data-bem], [onclick], [data-url]');
-            
-            for (var i = 0; i < elements.length; i++) {
-                var elem = elements[i];
-                
-                // Check data attributes
-                for (var attr of elem.attributes) {
-                    if (attr.value && attr.value.includes('http') && 
-                        !attr.value.includes('yandex.net') && 
-                        !attr.value.includes('yastatic')) {
-                        
-                        try {
-                            var decoded = decodeURIComponent(attr.value);
-                            if (decoded.startsWith('http') && 
-                                !decoded.includes('yandex.net') &&
-                                !decoded.includes('yastatic')) {
-                                urls.push(decoded);
-                            }
-                        } catch (e) {}
-                    }
-                }
-                
-                // Check onclick handlers
-                var onclick = elem.getAttribute('onclick') || '';
-                var urlMatch = onclick.match(/https?:\/\/[^'"\\s]+/g);
-                if (urlMatch) {
-                    for (var url of urlMatch) {
-                        if (!url.includes('yandex.net') && !url.includes('yastatic')) {
-                            urls.push(url);
+            // Method 1: From img_url parameters in links
+            document.querySelectorAll('a[href*="img_url="]').forEach(link => {
+                try {
+                    var urlMatch = link.href.match(/img_url=([^&]+)/);
+                    if (urlMatch) {
+                        var decoded = decodeURIComponent(urlMatch[1]);
+                        if (decoded.startsWith('http') && !decoded.includes('yandex') && !decoded.includes('yastatic')) {
+                            urls.add(decoded);
                         }
                     }
-                }
-            }
+                } catch(e) {}
+            });
             
-            return [...new Set(urls)]; // Remove duplicates
-        """)
-        
-        if data_urls:
-            urls.extend(data_urls)
-            print(f"Found {len(data_urls)} URLs from data attributes")
+            // Method 2: From data-bem attributes
+            document.querySelectorAll('[data-bem*="http"]').forEach(elem => {
+                try {
+                    var bem = elem.getAttribute('data-bem') || '';
+                    var matches = bem.match(/https?:\\/\\/[^"'\\s,}]+/g) || [];
+                    matches.forEach(url => {
+                        url = url.replace(/\\\\u[\da-f]{4}/gi, ''); // Remove unicode escapes
+                        if (!url.includes('yandex') && !url.includes('yastatic') && !url.includes('avatars.mds')) {
+                            urls.add(url);
+                        }
+                    });
+                } catch(e) {}
+            });
+            
+            // Method 3: From image sources and data attributes
+            document.querySelectorAll('img[src*="http"], [data-src*="http"]').forEach(img => {
+                try {
+                    var src = img.src || img.getAttribute('data-src') || '';
+                    if (src.startsWith('http') && !src.includes('yandex') && !src.includes('yastatic')) {
+                        urls.add(src);
+                    }
+                } catch(e) {}
+            });
+            
+            // Method 4: Look for JSON data in script tags or data attributes
+            document.querySelectorAll('script, [data-state]').forEach(elem => {
+                try {
+                    var content = elem.textContent || elem.getAttribute('data-state') || '';
+                    var matches = content.match(/https?:\\/\\/[^"'\\s,}\\]]+\\.(jpg|jpeg|png|webp|gif)/gi) || [];
+                    matches.forEach(url => {
+                        url = url.replace(/\\\\?/g, '');
+                        if (!url.includes('yandex') && !url.includes('yastatic')) {
+                            urls.add(url);
+                        }
+                    });
+                } catch(e) {}
+            });
+            
+            return Array.from(urls).slice(0, arguments[0]);
+        """, max_images)
         
         # Clean and filter URLs
-        cleaned_urls = []
-        seen = set()
-        
-        for url in urls:
-            # Clean URL
-            url = unquote(url)
-            
-            # Skip Yandex internal URLs and invalid URLs
-            skip_patterns = [
-                'yandex.net/i?id=',
-                'avatars.mds.yandex',
-                'yastatic.net',
-                'data:',
-                'blob:',
-                'javascript:',
-                'yandex.com'
-            ]
-            
-            if any(pattern in url for pattern in skip_patterns):
-                continue
-            
-            # Must be valid HTTP URL
-            if not url.startswith('http'):
-                continue
-            
-            # Add to list if not seen
-            if url not in seen:
-                seen.add(url)
-                cleaned_urls.append(url)
-        
-        print(f"Extracted {len(cleaned_urls)} unique image URLs after filtering")
-        
-        # Debug: print first few URLs
-        if cleaned_urls:
-            print("Sample URLs found:")
-            for i, url in enumerate(cleaned_urls[:5]):
-                print(f"  {i+1}. {url[:80]}...")
-        else:
-            print("No valid URLs extracted. Debugging page structure...")
-            # Debug page content
-            page_text = driver.execute_script("return document.body.innerText;")[:500]
-            print(f"Page content sample: {page_text}")
-            
-            # Check for any img elements
-            all_imgs = driver.find_elements(By.TAG_NAME, "img")
-            print(f"Total img elements found: {len(all_imgs)}")
-            
-            if all_imgs:
-                sample_src = all_imgs[0].get_attribute('src') if all_imgs else None
-                print(f"Sample img src: {sample_src}")
-        
-        return cleaned_urls[:max_images]
-        
-    except Exception as e:
-        print(f"Error extracting URLs: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    
-    return urls
-
-# -----------------------
-# ORB Feature Matching (Same as before)
-# -----------------------
-def calculate_orb_similarity(img1_path, img2_url, min_matches=8):
-    """
-    Uses ORB with BFMatcher for image matching
-    """
-    try:
-        # Load local image
-        img1 = cv2.imread(img1_path, cv2.IMREAD_GRAYSCALE)
-        if img1 is None:
-            return 0.0, 0
-        
-        # Download remote image
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://yandex.com/',
-            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
-        }
-        
-        resp = requests.get(img2_url, timeout=15, headers=headers, allow_redirects=True)
-        if resp.status_code != 200:
-            return 0.0, 0
-        
-        img_array = np.frombuffer(resp.content, np.uint8)
-        img2 = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-        
-        if img2 is None:
-            return 0.0, 0
-        
-        # Resize if too large
-        max_dim = 1000
-        h1, w1 = img1.shape
-        h2, w2 = img2.shape
-        
-        if max(h1, w1) > max_dim:
-            scale = max_dim / max(h1, w1)
-            new_w1, new_h1 = int(w1 * scale), int(h1 * scale)
-            img1 = cv2.resize(img1, (new_w1, new_h1))
-        
-        if max(h2, w2) > max_dim:
-            scale = max_dim / max(h2, w2)
-            new_w2, new_h2 = int(w2 * scale), int(h2 * scale)
-            img2 = cv2.resize(img2, (new_w2, new_h2))
-        
-        # Create ORB detector
-        orb = cv2.ORB_create(nfeatures=3000, scaleFactor=1.2, nlevels=8)
-        
-        # Find keypoints and descriptors
-        kp1, des1 = orb.detectAndCompute(img1, None)
-        kp2, des2 = orb.detectAndCompute(img2, None)
-        
-        if des1 is None or des2 is None or len(des1) < 5 or len(des2) < 5:
-            return 0.0, 0
-        
-        # BFMatcher for ORB
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        
-        # Match descriptors
-        matches = bf.knnMatch(des1, des2, k=2)
-        
-        # Apply Lowe's ratio test
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < 0.75 * n.distance:
-                    good_matches.append(m)
-        
-        num_good_matches = len(good_matches)
-        
-        # Geometric verification with RANSAC
-        if num_good_matches >= min_matches:
+        for url in extracted_urls:
             try:
-                src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                
-                if mask is not None:
-                    inliers = mask.ravel().tolist()
-                    num_inliers = sum(inliers)
-                    
-                    if num_inliers >= min_matches:
-                        similarity_score = num_inliers / min(len(kp1), len(kp2))
-                        return min(similarity_score, 1.0), num_inliers
+                url = unquote(url).strip()
+                if (url.startswith('http') and 
+                    not any(x in url.lower() for x in ['yandex', 'yastatic', 'data:', 'blob:', 'avatars.mds']) and
+                    any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif'])):
+                    urls.add(url)
             except:
-                pass
-        
-        # Fallback score
-        if num_good_matches > 0:
-            similarity_score = num_good_matches / min(len(kp1), len(kp2)) if min(len(kp1), len(kp2)) > 0 else 0
-            return min(similarity_score, 1.0), num_good_matches
-        
-        return 0.0, 0
-        
-    except Exception as e:
-        return 0.0, 0
-
-# -----------------------
-# Template Matching
-# -----------------------
-def calculate_template_matching(img1_path, img2_url):
-    """
-    Multi-scale template matching
-    """
-    try:
-        # Load images
-        img1 = cv2.imread(img1_path, cv2.IMREAD_GRAYSCALE)
-        if img1 is None:
-            return 0.0
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://yandex.com/'
-        }
-        
-        resp = requests.get(img2_url, timeout=15, headers=headers, allow_redirects=True)
-        if resp.status_code != 200:
-            return 0.0
-        
-        img_array = np.frombuffer(resp.content, np.uint8)
-        img2 = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-        
-        if img2 is None:
-            return 0.0
-        
-        h1, w1 = img1.shape
-        h2, w2 = img2.shape
-        
-        # Try multiple scales
-        scales = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
-        max_score = 0
-        
-        for scale in scales:
-            width = int(w1 * scale)
-            height = int(h1 * scale)
-            
-            if width > w2 or height > h2 or width < 20 or height < 20:
                 continue
+        
+        print(f"  Found {len(urls)} unique image URLs")
+        return list(urls)
+    
+    def calculate_orb_similarity(self, img1_path, img2_url):
+        """Optimized ORB similarity calculation"""
+        try:
+            # Load local image
+            img1 = cv2.imread(img1_path, cv2.IMREAD_GRAYSCALE)
+            if img1 is None:
+                return 0.0, 0
             
-            resized = cv2.resize(img1, (width, height))
-            result = cv2.matchTemplate(img2, resized, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(result)
-            max_score = max(max_score, max_val)
+            # Resize if too large
+            img1 = self._resize_image(img1, 800)
+            
+            # Download remote image with proper headers
+            session = requests.Session()
+            session.headers.update(self.headers)
+            
+            resp = session.get(img2_url, timeout=15, stream=True)
+            if resp.status_code != 200:
+                return 0.0, 0
+            
+            # Limit download size
+            content = b''
+            for chunk in resp.iter_content(chunk_size=8192):
+                content += chunk
+                if len(content) > 10 * 1024 * 1024:  # 10MB limit
+                    break
+            
+            img_array = np.frombuffer(content, np.uint8)
+            img2 = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+            
+            if img2 is None:
+                return 0.0, 0
+            
+            img2 = self._resize_image(img2, 800)
+            
+            # Compute ORB features
+            kp1, des1 = self.orb.detectAndCompute(img1, None)
+            kp2, des2 = self.orb.detectAndCompute(img2, None)
+            
+            if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
+                return 0.0, 0
+            
+            # Match features
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+            matches = bf.knnMatch(des1, des2, k=2)
+            
+            # Apply ratio test
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+            
+            num_matches = len(good_matches)
+            
+            # Geometric verification for high-confidence matches
+            if num_matches >= ORB_MIN_MATCHES:
+                try:
+                    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                    
+                    _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                    
+                    if mask is not None:
+                        inliers = sum(mask.ravel().tolist())
+                        if inliers >= ORB_MIN_MATCHES:
+                            score = inliers / min(len(kp1), len(kp2))
+                            return min(score, 1.0), inliers
+                except:
+                    pass
+            
+            # Fallback score based on raw matches
+            if num_matches > 0:
+                score = num_matches / min(len(kp1), len(kp2)) if min(len(kp1), len(kp2)) > 0 else 0
+                return min(score, 1.0), num_matches
+            
+            return 0.0, 0
+            
+        except Exception as e:
+            return 0.0, 0
+    
+    def _resize_image(self, img, max_dim):
+        """Helper to resize image if needed"""
+        h, w = img.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        return img
+    
+    def check_similarity_parallel(self, image_path, urls):
+        """Check multiple URLs in parallel"""
+        matched_urls = []
+        image_name = os.path.basename(image_path)
         
-        return max_score
+        print(f"  Checking {len(urls)} URLs for matches...")
         
-    except Exception as e:
-        return 0.0
-
-# -----------------------
-# Combined Similarity Check
-# -----------------------
-def is_similar_image(img1_path, img2_url):
-    """
-    Check if images are similar using ORB and template matching
-    """
-    orb_score, num_matches = calculate_orb_similarity(img1_path, img2_url, min_matches=8)
-    template_score = calculate_template_matching(img1_path, img2_url)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_url = {
+                executor.submit(self.calculate_orb_similarity, image_path, url): url 
+                for url in urls
+            }
+            
+            completed = 0
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                completed += 1
+                
+                try:
+                    orb_score, num_matches = future.result(timeout=20)
+                    
+                    print(f"  [{completed}/{len(urls)}] Score: {orb_score:.3f}, Matches: {num_matches}", end='\r')
+                    
+                    if orb_score >= ORB_SIMILARITY_THRESHOLD and num_matches >= ORB_MIN_MATCHES:
+                        matched_urls.append({
+                            'source_image': image_name,
+                            'matched_url': url,
+                            'orb_score': orb_score,
+                            'num_matches': num_matches
+                        })
+                        print(f"\n  ✓ Match found! Score: {orb_score:.3f}, URL: {url[:60]}...")
+                        
+                except Exception as e:
+                    continue
+        
+        print(f"\n  Completed similarity checking")
+        return matched_urls
     
-    # Relaxed thresholds for Yandex
-    is_match = (orb_score >= 0.008 and num_matches >= 8) or (template_score >= 0.7)
+    def process_image(self, image_path):
+        """Process single image"""
+        image_name = os.path.basename(image_path)
+        print(f"\n[Processing] {image_name}")
+        print("-" * 50)
+        
+        # Upload and navigate to similar images
+        if not self.upload_to_yandex(image_path):
+            print("  ❌ Upload failed")
+            return []
+        
+        # Extract image URLs
+        urls = self.extract_image_urls(max_images=50)
+        
+        if not urls:
+            print("  ❌ No URLs found")
+            return []
+        
+        print(f"  Found {len(urls)} URLs to check")
+        
+        # Check similarity in parallel
+        matches = self.check_similarity_parallel(image_path, urls)
+        
+        print(f"  ✅ {len(matches)} matches found for {image_name}")
+        return matches
     
-    return is_match, orb_score, template_score, num_matches
-
-# -----------------------
-# Process Single Image
-# -----------------------
-def process_image(driver, image_path):
-    """Process a single image through Yandex Image Search"""
-    image_name = os.path.basename(image_path)
-    print(f"\nProcessing: {image_name}")
-    print("-" * 50)
+    def save_results(self, all_matches):
+        """Save results to CSV"""
+        if not all_matches:
+            print("No matches to save")
+            return
+        
+        with open(self.output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Source Image', 'Matched URL', 'ORB Score', 'Feature Matches'])
+            
+            for match in all_matches:
+                writer.writerow([
+                    match['source_image'],
+                    match['matched_url'],
+                    f"{match['orb_score']:.4f}",
+                    match['num_matches']
+                ])
+        
+        print(f"\n📄 Results saved to {self.output_file}")
     
-    # Upload to Yandex and navigate to similar images
-    print("Uploading to Yandex Image Search...")
-    success = upload_to_yandex(driver, image_path)
-    
-    if not success:
-        print("Failed to navigate to similar images page")
-        return []
-    
-    # Extract URLs from similar images page
-    print("Extracting image URLs from similar images results...")
-    urls = get_yandex_image_urls(driver, max_images=50)
-    
-    if not urls:
-        print("No URLs found - please check if page loaded correctly")
-        print(f"Current URL: {driver.current_url[:100]}")
-        return []
-    
-    print(f"Found {len(urls)} valid image URLs to check")
-    
-    # Check similarity
-    matched_urls = []
-    print("\nChecking for matches...")
-    
-    for i, url in enumerate(urls, 1):
-        print(f"  Checking [{i}/{len(urls)}]: {url[:60]}...", end='')
+    def run(self):
+        """Main execution"""
+        print("=" * 80)
+        print("🔍 YANDEX IMAGE MATCHER - Fixed Version")
+        print("=" * 80)
+        
+        # Get images
+        image_files = self.get_image_files()
+        
+        if not image_files:
+            print("❌ No images found in the folder!")
+            return
+        
+        print(f"📁 Found {len(image_files)} images to process")
+        
+        # Initialize driver
+        print("🚀 Initializing browser...")
+        self.driver = self.init_driver()
+        
+        all_matches = []
         
         try:
-            is_match, orb_score, template_score, num_matches = is_similar_image(image_path, url)
+            # Process each image
+            for idx, image_path in enumerate(image_files, 1):
+                print(f"\n🖼️  [{idx}/{len(image_files)}] Processing: {os.path.basename(image_path)}")
+                matches = self.process_image(image_path)
+                all_matches.extend(matches)
+                
+                # Delay between images to avoid rate limiting
+                if idx < len(image_files):
+                    print("  ⏳ Waiting before next image...")
+                    time.sleep(2)
             
-            if is_match:
-                print(f"\n  ✓ MATCH FOUND!")
-                print(f"    ORB: {orb_score:.4f} ({num_matches} matches), Template: {template_score:.4f}")
+            # Results summary
+            print("\n" + "=" * 80)
+            print("📊 RESULTS SUMMARY")
+            print("=" * 80)
+            
+            self.save_results(all_matches)
+            
+            # Statistics
+            print(f"\n📈 Statistics:")
+            print(f"   • Images processed: {len(image_files)}")
+            print(f"   • Total matches found: {len(all_matches)}")
+            
+            # Per-image breakdown
+            matches_by_source = defaultdict(list)
+            for match in all_matches:
+                matches_by_source[match['source_image']].append(match)
+            
+            if matches_by_source:
+                print(f"\n📋 Matches per image:")
+                for source, matches in matches_by_source.items():
+                    avg_score = sum(m['orb_score'] for m in matches) / len(matches)
+                    print(f"   • {source}: {len(matches)} matches (avg score: {avg_score:.3f})")
+            
+            print(f"\n✅ Processing complete!")
                 
-                matched_urls.append({
-                    'source_image': image_name,
-                    'matched_url': url,
-                    'orb_score': orb_score,
-                    'template_score': template_score,
-                    'num_matches': num_matches
-                })
-            else:
-                print(f" [ORB: {orb_score:.3f}, Template: {template_score:.3f}]")
-                
+        except KeyboardInterrupt:
+            print("\n⚠️  Interrupted by user")
         except Exception as e:
-            print(f"\n  ⚠ Error: {str(e)}")
-            continue
-    
-    print(f"\n✓ Found {len(matched_urls)} matching images for {image_name}")
-    return matched_urls
+            print(f"\n❌ Error: {str(e)}")
+        finally:
+            if self.driver:
+                print("🔚 Closing browser...")
+                self.driver.quit()
+            print("👋 Done!")
 
-# -----------------------
-# Save Results
-# -----------------------
-def save_results(all_matches, filename="yandex_matched_images.csv"):
-    """Save matched URLs to CSV"""
-    if not all_matches:
-        print("No matches to save")
-        return
-    
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Source Image', 'Matched URL', 'ORB Score', 'Template Score', 'Feature Matches'])
-        
-        for match in all_matches:
-            writer.writerow([
-                match['source_image'],
-                match['matched_url'],
-                f"{match['orb_score']:.4f}",
-                f"{match['template_score']:.4f}",
-                match['num_matches']
-            ])
-    
-    print(f"✓ Results saved to {filename}")
-
-# -----------------------
-# Main Function
-# -----------------------
 def main():
-    # Configuration
-    IMAGES_FOLDER = 'images'
-    OUTPUT_FILE = 'yandex_matched_images.csv'
-    BATCH_DELAY = 5
-    
-    print("=" * 60)
-    print("YANDEX IMAGE SEARCH MATCHER")
-    print("Using ORB feature matching + Template matching")
-    print("=" * 60)
-    
-    # Get images
-    print(f"\nScanning folder: {IMAGES_FOLDER}")
-    image_files = get_image_files(IMAGES_FOLDER)
-    
-    if not image_files:
-        print(f"No images found in '{IMAGES_FOLDER}' folder!")
-        return
-    
-    print(f"Found {len(image_files)} images:")
-    for img in image_files:
-        print(f"  • {os.path.basename(img)}")
-    
-    # Initialize browser
-    print("\nInitializing browser...")
-    driver = init_driver()
-    
-    all_matches = []
-    
-    try:
-        # Process each image
-        for idx, image_path in enumerate(image_files, 1):
-            print(f"\n{'='*60}")
-            print(f"[{idx}/{len(image_files)}] Processing image {idx} of {len(image_files)}")
-            print(f"{'='*60}")
-            
-            matches = process_image(driver, image_path)
-            all_matches.extend(matches)
-            
-            # Delay between images
-            if idx < len(image_files):
-                print(f"\nWaiting {BATCH_DELAY} seconds before next image...")
-                time.sleep(BATCH_DELAY)
-        
-        # Save results
-        print("\n" + "=" * 60)
-        print("FINAL RESULTS")
-        print("=" * 60)
-        
-        save_results(all_matches, OUTPUT_FILE)
-        
-        # Summary
-        print(f"\nSUMMARY:")
-        print(f"  • Images processed: {len(image_files)}")
-        print(f"  • Total matches found: {len(all_matches)}")
-        
-        # Show matches per image
-        from collections import defaultdict
-        matches_by_source = defaultdict(list)
-        for match in all_matches:
-            matches_by_source[match['source_image']].append(match)
-        
-        print(f"\nMatches per image:")
-        for source, matches in matches_by_source.items():
-            print(f"  • {source}: {len(matches)} matches")
-            if matches:
-                best_match = max(matches, key=lambda x: x['orb_score'])
-                print(f"    Best match: ORB={best_match['orb_score']:.3f}, Template={best_match['template_score']:.3f}")
-        
-    except KeyboardInterrupt:
-        print("\n\nProcess interrupted by user")
-    except Exception as e:
-        print(f"\nError: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("\nClosing browser...")
-        driver.quit()
-        print("Done!")
+    # You can customize these parameters
+    matcher = YandexImageMatcher(
+        images_folder='images',           # Folder containing your images
+        output_file='yandex_matches.csv' # Output CSV file
+    )
+    matcher.run()
 
 if __name__ == "__main__":
     main()
