@@ -16,6 +16,8 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from collections import defaultdict
 import argparse
 import logging
+import shutil
+from datetime import datetime
 
 # -----------------------
 # Logging Setup
@@ -63,6 +65,87 @@ class YandexImageMatcher:
         self.orb_min_matches = orb_min_matches
         self.orb_similarity_threshold = orb_similarity_threshold
         self.batch_delay = batch_delay
+        
+        # Create required folders
+        self.create_folders()
+        
+        # Create log file for processing times
+        self.log_filename = f"yandex_processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.log_writer = None
+
+        # For saving image links concurrently
+        self.links_filename = f"yandex_image_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.links_file = open(self.links_filename, 'w', newline='', encoding='utf-8')
+        self.links_writer = csv.writer(self.links_file)
+        self.links_writer.writerow(['Source Image', 'Matched URL'])
+
+        # Counter for processed images
+        self.processed_count = 0
+        self.total_images = 0
+
+    def create_folders(self):
+        """Create required folders"""
+        folders = ['done', 'similar_images']
+        for folder in folders:
+            os.makedirs(folder, exist_ok=True)
+
+    def move_image_to_done(self, image_path):
+        """Move processed image to done folder"""
+        try:
+            done_folder = Path('done')
+            done_folder.mkdir(exist_ok=True)
+            
+            source = Path(image_path)
+            destination = done_folder / source.name
+            
+            # If file already exists in done folder, add timestamp
+            if destination.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                name_parts = source.stem, timestamp, source.suffix
+                destination = done_folder / f"{name_parts[0]}_{name_parts[1]}{name_parts[2]}"
+            
+            shutil.move(str(source), str(destination))
+            logging.info(f"Moved {source.name} to done folder")
+        except Exception as e:
+            logging.error(f"Failed to move {image_path} to done folder: {e}")
+
+    def download_similar_image(self, url, source_image_name, orb_score, timeout=10):
+        """Download similar image with naming convention"""
+        try:
+            similar_folder = Path('similar_images')
+            similar_folder.mkdir(exist_ok=True)
+            
+            session = requests.Session()
+            session.headers.update(self.headers)
+            
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
+            
+            # Extract file extension from URL or use jpg as default
+            url_parts = url.split('.')
+            extension = url_parts[-1].split('?')[0] if len(url_parts) > 1 else 'jpg'
+            if extension not in ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp']:
+                extension = 'jpg'
+            
+            # Create filename with naming convention
+            source_name = Path(source_image_name).stem
+            filename = f"{source_name}_{orb_score:.4f}.{extension}"
+            filepath = similar_folder / filename
+            
+            # If file exists, add timestamp
+            if filepath.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{source_name}_{orb_score:.4f}_{timestamp}.{extension}"
+                filepath = similar_folder / filename
+            
+            with open(filepath, 'wb') as f:
+                f.write(response.content)
+            
+            logging.info(f"Downloaded similar image: {filename}")
+            return str(filepath)
+        except Exception as e:
+            logging.error(f"Failed to download image from {url}: {e}")
+            return None
 
     def init_driver(self):
         """Initialize undetected Chrome driver in headless mode for production"""
@@ -335,26 +418,38 @@ class YandexImageMatcher:
         matched_urls = []
         image_name = os.path.basename(image_path)
         logging.info(f"Checking {len(urls)} URLs for matches...")
+        
+        def check_url_and_download(url):
+            orb_score, num_matches = self.calculate_orb_similarity(image_path, url)
+            logging.info(f"Score: {orb_score:.3f}, Matches: {num_matches}")
+            # Save the image link as soon as processed
+            self.links_writer.writerow([image_name, url])
+            self.links_file.flush()
+            if orb_score >= self.orb_similarity_threshold and num_matches >= self.orb_min_matches:
+                # Download the similar image
+                downloaded_path = self.download_similar_image(url, image_name, orb_score)
+                logging.info(f"✓ Match found! Score: {orb_score:.3f}, URL: {url[:60]}...")
+                return {
+                    'source_image': image_name,
+                    'matched_url': url,
+                    'orb_score': orb_score,
+                    'num_matches': num_matches,
+                    'downloaded_path': downloaded_path
+                }
+            return None
+        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_url = {
-                executor.submit(self.calculate_orb_similarity, image_path, url): url 
+                executor.submit(check_url_and_download, url): url 
                 for url in urls
             }
             completed = 0
             for future in as_completed(future_to_url):
-                url = future_to_url[future]
                 completed += 1
                 try:
-                    orb_score, num_matches = future.result(timeout=30)
-                    logging.info(f"[{completed}/{len(urls)}] Score: {orb_score:.3f}, Matches: {num_matches}")
-                    if orb_score >= self.orb_similarity_threshold and num_matches >= self.orb_min_matches:
-                        matched_urls.append({
-                            'source_image': image_name,
-                            'matched_url': url,
-                            'orb_score': orb_score,
-                            'num_matches': num_matches
-                        })
-                        logging.info(f"✓ Match found! Score: {orb_score:.3f}, URL: {url[:60]}...")
+                    result = future.result(timeout=30)
+                    if result:
+                        matched_urls.append(result)
                 except Exception:
                     continue
         logging.info("Completed similarity checking")
@@ -363,17 +458,47 @@ class YandexImageMatcher:
     def process_image(self, image_path):
         """Process single image"""
         image_name = os.path.basename(image_path)
+        start_time = time.time()
         logging.info(f"[Processing] {image_name}")
+        
         if not self.upload_to_yandex(image_path):
+            end_time = time.time()
+            processing_time = end_time - start_time
+            if self.log_writer:
+                self.log_writer.writerow([image_name, f"{processing_time:.2f}", 0, "Upload failed"])
             logging.error("Upload failed")
             return []
+        
         urls = self.extract_image_urls(self.max_images)
         if not urls:
+            end_time = time.time()
+            processing_time = end_time - start_time
+            if self.log_writer:
+                self.log_writer.writerow([image_name, f"{processing_time:.2f}", 0, "No URLs found"])
             logging.error("No URLs found")
             return []
+        
         logging.info(f"Found {len(urls)} URLs to check")
         matches = self.check_similarity_parallel(image_path, urls)
-        logging.info(f"{len(matches)} matches found for {image_name}")
+        
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        # Log the processing time
+        if self.log_writer:
+            self.log_writer.writerow([image_name, f"{processing_time:.2f}", len(matches), f"Found {len(matches)} matches"])
+        
+        logging.info(f"{len(matches)} matches found for {image_name} (took {processing_time:.2f}s)")
+        
+        # Move processed image to done folder concurrently
+        move_executor = ThreadPoolExecutor(max_workers=1)
+        move_executor.submit(self.move_image_to_done, image_path)
+        move_executor.shutdown(wait=False)
+
+        # Counter for processed images
+        self.processed_count += 1
+        logging.info(f"Processed {self.processed_count} of {self.total_images} images.")
+
         return matches
 
     def save_results(self, all_matches):
@@ -383,13 +508,14 @@ class YandexImageMatcher:
             return
         with open(self.output_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Source Image', 'Matched URL', 'ORB Score', 'Feature Matches'])
+            writer.writerow(['Source Image', 'Matched URL', 'ORB Score', 'Feature Matches', 'Downloaded Path'])
             for match in all_matches:
                 writer.writerow([
                     match['source_image'],
                     match['matched_url'],
                     f"{match['orb_score']:.4f}",
-                    match['num_matches']
+                    match['num_matches'],
+                    match.get('downloaded_path', 'Failed to download')
                 ])
         logging.info(f"Results saved to {self.output_file}")
 
@@ -399,25 +525,35 @@ class YandexImageMatcher:
         logging.info("YANDEX IMAGE ORB MATCHER - Production Version")
         logging.info("=" * 80)
         image_files = self.get_image_files()
+        self.total_images = len(image_files)
         if not image_files:
             logging.error("No images found in the folder!")
             return
-        logging.info(f"Found {len(image_files)} images to process")
+        logging.info(f"Found {self.total_images} images to process")
         self.driver = self.init_driver()
         all_matches = []
+        
         try:
-            for idx, image_path in enumerate(image_files, 1):
-                logging.info(f"[{idx}/{len(image_files)}] Processing: {os.path.basename(image_path)}")
-                matches = self.process_image(image_path)
-                all_matches.extend(matches)
-                if idx < len(image_files):
-                    time.sleep(self.batch_delay)
+            with open(self.log_filename, 'w', newline='', encoding='utf-8') as log_file:
+                self.log_writer = csv.writer(log_file)
+                self.log_writer.writerow(['Image Name', 'Processing Time (seconds)', 'Matches Found', 'Notes'])
+                
+                for idx, image_path in enumerate(image_files, 1):
+                    logging.info(f"[{idx}/{self.total_images}] Processing: {os.path.basename(image_path)}")
+                    matches = self.process_image(image_path)
+                    all_matches.extend(matches)
+                    if idx < self.total_images:
+                        time.sleep(self.batch_delay)
+                        
             logging.info("=" * 80)
             logging.info("RESULTS SUMMARY")
             logging.info("=" * 80)
             self.save_results(all_matches)
-            logging.info(f"Images processed: {len(image_files)}")
+            logging.info(f"Images processed: {self.total_images}")
             logging.info(f"Total matches found: {len(all_matches)}")
+            logging.info(f"Processing log saved to {self.log_filename}")
+            logging.info(f"Image links saved to {self.links_filename}")
+            
             matches_by_source = defaultdict(list)
             for match in all_matches:
                 matches_by_source[match['source_image']].append(match)
@@ -426,11 +562,13 @@ class YandexImageMatcher:
                     avg_score = sum(m['orb_score'] for m in matches) / len(matches)
                     logging.info(f"{source}: {len(matches)} matches (avg score: {avg_score:.3f})")
             logging.info("Processing complete!")
+            
         except KeyboardInterrupt:
             logging.info("Interrupted by user")
         except Exception as e:
             logging.error(f"Error: {str(e)}")
         finally:
+            self.links_file.close()
             if self.driver:
                 logging.info("Closing browser...")
                 self.driver.quit()
