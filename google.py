@@ -1,132 +1,123 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Google Lens Visual Search and FLANN Matcher
+
+This script automates reverse image searches using Google Lens. For each local image,
+it uploads it to Google Lens, scrapes the URLs of visually similar images,
+and then uses the FLANN (Fast Library for Approximate Nearest Neighbors) algorithm
+to find the best match among the results.
+
+Key Features:
+- Uses undetected_chromedriver to avoid bot detection.
+- Processes a batch of images from a specified folder.
+- Finds the single best match for each source image based on feature similarity.
+- Creates a stitched comparison image showing the original and the best match side-by-side.
+- Moves ONLY the successfully matched original images to a 'done' folder.
+- Generates CSV logs for processing details, found URLs, and final matches.
+
+Optimizations in this version:
+1.  Speed: Replaced static 'time.sleep' calls with dynamic WebDriverWait for faster execution.
+2.  Efficiency: Loads the source image into memory once per run, avoiding repeated disk reads during comparison.
+3.  Logic: Only moves source images to the 'done' folder if a match is found.
+"""
+
 import time
 import csv
 import cv2
 import numpy as np
 import requests
 import os
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import glob
+from urllib.parse import unquote
+import argparse
 import logging
-from bs4 import BeautifulSoup
+import shutil
+from datetime import datetime
+import subprocess
+import platform
+
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from pathlib import Path
-import glob
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import argparse
-import shutil
-from datetime import datetime
-import torch
-import kornia as K
-import kornia.feature as KF
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
+# -----------------------
+# Logging Setup
+# -----------------------
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
 # -----------------------
-# LoFTR Setup
+# Kill Chrome Processes (for macOS/Linux issues)
 # -----------------------
-class LoFTRMatcher:
-    def __init__(self):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.matcher = KF.LoFTR(pretrained='outdoor').to(self.device).eval()
-        logging.info(f"LoFTR initialized on {self.device}")
-    
-    def preprocess_image(self, img, target_size=640):
-        """Preprocess image for LoFTR"""
-        if len(img.shape) == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # Resize while maintaining aspect ratio
-        h, w = img.shape
-        scale = target_size / max(h, w)
-        new_h, new_w = int(h * scale), int(w * scale)
-        img = cv2.resize(img, (new_w, new_h))
-        
-        # Convert to tensor and normalize
-        img_tensor = torch.from_numpy(img).float()[None, None] / 255.0
-        return img_tensor.to(self.device)
-    
-    def match_images(self, img1_path, img2_array):
-        """Match two images using LoFTR"""
+def kill_chrome_processes():
+    """Kill existing Chrome/Chromium processes to prevent conflicts."""
+    if platform.system() in ["Darwin", "Linux"]:
+        for process_name in ["Google Chrome", "Chromium", "chrome"]:
+            try:
+                # Use pkill to forcefully terminate processes by name
+                subprocess.run(["pkill", "-f", process_name], check=False, capture_output=True)
+            except FileNotFoundError:
+                # pkill might not be available on all systems
+                pass
+    elif platform.system() == "Windows":
         try:
-            # Read first image
-            img1 = cv2.imread(img1_path)
-            if img1 is None:
-                return 0.0, 0
-            
-            # Second image is already numpy array
-            if img2_array is None:
-                return 0.0, 0
-            
-            # Preprocess images
-            img1_tensor = self.preprocess_image(img1)
-            img2_tensor = self.preprocess_image(img2_array)
-            
-            # Prepare input
-            input_dict = {
-                'image0': img1_tensor,
-                'image1': img2_tensor
-            }
-            
-            # Run LoFTR
-            with torch.no_grad():
-                correspondences = self.matcher(input_dict)
-            
-            # Extract matches
-            mkpts0 = correspondences['keypoints0'].cpu().numpy()
-            mkpts1 = correspondences['keypoints1'].cpu().numpy()
-            confidence = correspondences['confidence'].cpu().numpy()
-            
-            # Filter high-confidence matches
-            high_conf_mask = confidence > 0.8
-            num_high_conf = high_conf_mask.sum()
-            
-            # Calculate similarity score
-            num_matches = len(mkpts0)
-            if num_matches > 0:
-                avg_confidence = confidence.mean()
-                # Weighted score: number of matches and average confidence
-                similarity_score = (num_high_conf / 100.0) * avg_confidence
-                similarity_score = min(similarity_score, 1.0)  # Cap at 1.0
-            else:
-                similarity_score = 0.0
-            
-            return similarity_score, num_high_conf
-            
-        except Exception as e:
-            logging.error(f"LoFTR matching error: {e}")
-            return 0.0, 0
-
-# Global LoFTR instance
-loftr_matcher = None
-
-def init_loftr():
-    global loftr_matcher
-    if loftr_matcher is None:
-        loftr_matcher = LoFTRMatcher()
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], check=False, capture_output=True)
+        except FileNotFoundError:
+            pass
+    time.sleep(2) # Give a moment for processes to terminate
 
 # -----------------------
 # Browser Setup
 # -----------------------
 def init_driver():
+    """Initializes the undetected_chromedriver with optimized options."""
+    kill_chrome_processes()
+    
     options = uc.ChromeOptions()
-    # options.add_argument("--no-sandbox")
-    options.add_argument("--headless=new")
-    options.binary_location = "/usr/bin/google-chrome"
-    options.add_argument("--user-data-dir=/tmp/chrome-user-data")
-    options.add_argument("--profile-directory=Default")
+    
+    # --- Performance & Stealth Options ---
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    # options.add_argument("--headless=new")  # Uncomment for headless mode
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    driver = uc.Chrome(options=options)
-    return driver
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--disable-plugins-discovery")
+    
+    # Using a temporary user data directory for a clean session
+    user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", f"chrome_data_{os.getpid()}")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+    
+    try:
+        logging.info("Attempting to initialize Chrome driver...")
+        driver = uc.Chrome(options=options, version_main=None)
+        # Hides the "navigator.webdriver" property that signals automation
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        return driver
+    except WebDriverException as e:
+        logging.error(f"Failed to initialize Chrome driver: {e}")
+        logging.info("Trying with a simpler configuration...")
+        driver = uc.Chrome(options=options, use_subprocess=True)
+        return driver
 
 # -----------------------
 # Create Required Folders
 # -----------------------
 def create_folders():
+    """Creates necessary output folders if they don't exist."""
     folders = ['done', 'similar_images']
     for folder in folders:
         os.makedirs(folder, exist_ok=True)
@@ -135,477 +126,445 @@ def create_folders():
 # Move Image to Done Folder
 # -----------------------
 def move_image_to_done(image_path):
+    """Moves a successfully processed image to the 'done' folder."""
     try:
         done_folder = Path('done')
-        done_folder.mkdir(exist_ok=True)
-        
         source = Path(image_path)
         destination = done_folder / source.name
         
-        # If file already exists in done folder, add timestamp
+        # Avoid overwriting by adding a timestamp if the file already exists
         if destination.exists():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            name_parts = source.stem, timestamp, source.suffix
-            destination = done_folder / f"{name_parts[0]}_{name_parts[1]}{name_parts[2]}"
+            destination = done_folder / f"{source.stem}_{timestamp}{source.suffix}"
         
         shutil.move(str(source), str(destination))
-        logging.info(f"Moved {source.name} to done folder")
+        logging.info(f"Moved '{source.name}' to 'done' folder.")
     except Exception as e:
-        logging.error(f"Failed to move {image_path} to done folder: {e}")
+        logging.error(f"Failed to move '{image_path}': {e}")
 
 # -----------------------
-# Download Similar Image
+# Create and Save Stitched Comparison Image
 # -----------------------
-def download_similar_image(url, source_image_name, loftr_score, timeout=10):
+def create_comparison_image(source_path, similar_img_bytes, score, matches, output_folder='similar_images'):
+    """Creates a side-by-side comparison image of the original and the best match."""
     try:
-        similar_folder = Path('similar_images')
-        similar_folder.mkdir(exist_ok=True)
+        original_img = cv2.imread(source_path)
+        if original_img is None:
+            logging.error(f"Could not read source image: {source_path}")
+            return None
+
+        similar_img_np = np.frombuffer(similar_img_bytes, np.uint8)
+        similar_img = cv2.imdecode(similar_img_np, cv2.IMREAD_COLOR)
+        if similar_img is None:
+            logging.error("Could not decode downloaded similar image.")
+            return None
+
+        # --- Image Resizing to a common height for consistent comparison ---
+        target_height = 600
+        original_h, original_w = original_img.shape[:2]
+        similar_h, similar_w = similar_img.shape[:2]
+
+        original_ratio = target_height / original_h
+        original_resized = cv2.resize(original_img, (int(original_w * original_ratio), target_height))
+
+        similar_ratio = target_height / similar_h
+        similar_resized = cv2.resize(similar_img, (int(similar_w * similar_ratio), target_height))
+
+        # --- Create Canvas for stitching images and adding text ---
+        text_area_height = 80
+        total_width = original_resized.shape[1] + similar_resized.shape[1]
+        total_height = target_height + text_area_height
         
-        response = requests.get(url, timeout=timeout, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        response.raise_for_status()
+        stitched_image = np.full((total_height, total_width, 3), 255, dtype=np.uint8) # White canvas
+
+        # Place resized images side-by-side
+        stitched_image[text_area_height:total_height, :original_resized.shape[1]] = original_resized
+        stitched_image[text_area_height:total_height, original_resized.shape[1]:] = similar_resized
+
+        # --- Add text labels to the top of the canvas ---
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.8
+        font_color = (0, 0, 0) # Black
+        thickness = 2
         
-        # Extract file extension from URL or use jpg as default
-        url_parts = url.split('.')
-        extension = url_parts[-1].split('?')[0] if len(url_parts) > 1 else 'jpg'
-        if extension not in ['jpg', 'jpeg', 'png', 'bmp', 'gif']:
-            extension = 'jpg'
+        text1 = "Original Image"
+        text2 = f"Google | Score: {score:.4f} | Matches: {matches}"
         
-        # Create filename with naming convention
-        source_name = Path(source_image_name).stem
-        filename = f"{source_name}_{loftr_score:.4f}.{extension}"
-        filepath = similar_folder / filename
+        # Center text above each respective image
+        text1_size = cv2.getTextSize(text1, font, font_scale, thickness)[0]
+        text1_x = (original_resized.shape[1] - text1_size[0]) // 2
+        text1_y = (text_area_height - text1_size[1]) // 2 + text1_size[1]
+
+        text2_size = cv2.getTextSize(text2, font, font_scale, thickness)[0]
+        text2_x = original_resized.shape[1] + (similar_resized.shape[1] - text2_size[0]) // 2
+        text2_y = (text_area_height - text2_size[1]) // 2 + text2_size[1]
         
-        # If file exists, add timestamp
+        cv2.putText(stitched_image, text1, (text1_x, text1_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        cv2.putText(stitched_image, text2, (text2_x, text2_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+
+        # --- Save the final composite image ---
+        source_name = Path(source_path).stem
+        save_folder = Path(output_folder)
+        filename = f"{source_name}_comparison_{score:.4f}.jpg"
+        filepath = save_folder / filename
+
         if filepath.exists():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{source_name}_{loftr_score:.4f}_{timestamp}.{extension}"
-            filepath = similar_folder / filename
-        
-        with open(filepath, 'wb') as f:
-            f.write(response.content)
-        
-        logging.info(f"Downloaded similar image: {filename}")
+            filepath = save_folder / f"{source_name}_comparison_{score:.4f}_{timestamp}.jpg"
+            
+        cv2.imwrite(str(filepath), stitched_image)
+        logging.info(f"Saved comparison image: {filepath.name}")
         return str(filepath)
+
     except Exception as e:
-        logging.error(f"Failed to download image from {url}: {e}")
+        logging.error(f"Failed to create comparison image for {source_path}: {e}")
         return None
 
 # -----------------------
-# Upload and Extract URLs with Full Frame Selection
+# Download Image and Create Comparison
 # -----------------------
-def upload_image(driver, image_path, timeout=30):
-    """Upload image and handle full frame selection"""
-    abs_path = os.path.abspath(image_path)
-    
-    # Navigate to Google Lens
-    driver.get("https://lens.google.com")
-    time.sleep(2)
-    
-    # Find and click the camera/upload button
+def download_and_create_comparison(url, source_image_path, flann_score, num_matches, timeout=10):
+    """Downloads the best match and triggers the comparison image creation."""
     try:
-        # Try different selectors for the upload button
-        upload_selectors = [
-            "svg[class*='camera']",
-            "button[aria-label*='Search by image']",
-            "div[aria-label*='Search by image']",
-            "[data-promo-id*='camera']",
-            "div[role='button'] svg"
-        ]
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Referer': 'https://lens.google.com/'
+        }
+        response = requests.get(url, timeout=timeout, headers=headers)
+        response.raise_for_status()
         
-        for selector in upload_selectors:
-            try:
-                upload_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                if upload_btn:
-                    upload_btn.click()
-                    time.sleep(1)
-                    break
-            except:
-                continue
-    except:
-        pass
-    
-    # Upload the file
-    try:
-        upload_input = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
+        return create_comparison_image(
+            source_path=source_image_path,
+            similar_img_bytes=response.content,
+            score=flann_score,
+            matches=num_matches
         )
-        upload_input.send_keys(abs_path)
-        logging.info(f"Uploaded image: {os.path.basename(image_path)}")
-    except Exception as e:
-        logging.error(f"Failed to upload image: {e}")
-        return False
-    
-    # Wait for image to process
-    time.sleep(3)
-    
-    # Try to select full frame
-    try:
-        # Look for selection interface
-        selection_found = False
-        
-        # Try to find crop/selection interface
-        crop_selectors = [
-            "div[role='button'][aria-label*='Done']",
-            "button[aria-label*='Done']",
-            "div[aria-label*='Select all']",
-            "button[aria-label*='Use full image']",
-            "span:contains('Done')",
-            "button:contains('Done')"
-        ]
-        
-        for selector in crop_selectors:
-            try:
-                element = WebDriverWait(driver, 3).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                )
-                element.click()
-                selection_found = True
-                logging.info("Clicked selection/done button")
-                break
-            except:
-                continue
-        
-        # If no selection interface, image might be automatically processed
-        if not selection_found:
-            logging.info("No selection interface found, proceeding with auto-detection")
-            
-    except Exception as e:
-        logging.info(f"Selection interface handling: {e}")
-    
-    # Wait for results to load
-    time.sleep(5)
-    
-    # Check if we're on a results page
-    current_url = driver.current_url
-    if "search" in current_url or "lens" in current_url:
-        logging.info(f"Successfully navigated to results page")
-        return True
-    
-    return False
-
-def get_image_urls(driver, max_images=40):
-    """Extract image URLs from Google Lens results with improved logic"""
-    urls = set()
-    
-    # Wait for initial results to load
-    time.sleep(3)
-    
-    # Scroll to load more images
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    scroll_attempts = 0
-    max_scrolls = 5
-    
-    while scroll_attempts < max_scrolls:
-        # Scroll down
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
-        
-        # Check for "Show more results" button and click if exists
-        try:
-            show_more_selectors = [
-                "button[aria-label*='Show more']",
-                "div[role='button'][aria-label*='More']",
-                "span:contains('Show more')",
-                "button:contains('More results')"
-            ]
-            for selector in show_more_selectors:
-                try:
-                    show_more = driver.find_element(By.CSS_SELECTOR, selector)
-                    if show_more and show_more.is_displayed():
-                        show_more.click()
-                        time.sleep(2)
-                        break
-                except:
-                    continue
-        except:
-            pass
-        
-        # Calculate new scroll height
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            scroll_attempts += 1
-        else:
-            scroll_attempts = 0
-        last_height = new_height
-    
-    # Parse the page source
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    
-    # Find all image elements with multiple strategies
-    # Strategy 1: Direct img tags
-    for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or img.get("data-iurl")
-        if src and src.startswith("http") and "google" not in src.lower():
-            urls.add(src)
-    
-    # Strategy 2: Links with image parameters
-    for link in soup.find_all("a", href=True):
-        href = link.get("href")
-        if href and ("imgurl=" in href or "img_url=" in href):
-            # Extract image URL from parameters
-            import urllib.parse
-            try:
-                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-                if "imgurl" in parsed:
-                    urls.add(parsed["imgurl"][0])
-                elif "img_url" in parsed:
-                    urls.add(parsed["img_url"][0])
-            except:
-                pass
-    
-    # Strategy 3: Divs with background images
-    for div in soup.find_all("div", style=True):
-        style = div.get("style")
-        if style and "background-image" in style and "url(" in style:
-            try:
-                url_start = style.index("url(") + 4
-                url_end = style.index(")", url_start)
-                url = style[url_start:url_end].strip("'\"")
-                if url.startswith("http"):
-                    urls.add(url)
-            except:
-                pass
-    
-    # Strategy 4: Data attributes
-    for elem in soup.find_all(attrs={"data-thumbnail-url": True}):
-        url = elem.get("data-thumbnail-url")
-        if url and url.startswith("http"):
-            urls.add(url)
-    
-    # Convert to list and limit
-    url_list = list(urls)[:max_images]
-    
-    logging.info(f"Found {len(url_list)} unique image URLs")
-    
-    # If no URLs found, try alternative extraction
-    if not url_list:
-        logging.warning("No URLs found with primary methods, trying JavaScript extraction")
-        try:
-            # Try to extract URLs via JavaScript
-            js_urls = driver.execute_script("""
-                var urls = [];
-                var imgs = document.querySelectorAll('img[src*="http"], img[data-src*="http"]');
-                imgs.forEach(function(img) {
-                    var src = img.src || img.getAttribute('data-src');
-                    if (src && src.startsWith('http') && !src.includes('google')) {
-                        urls.push(src);
-                    }
-                });
-                return urls;
-            """)
-            if js_urls:
-                url_list = list(set(js_urls))[:max_images]
-                logging.info(f"Found {len(url_list)} URLs via JavaScript")
-        except Exception as e:
-            logging.error(f"JavaScript extraction failed: {e}")
-    
-    return url_list
+    except requests.RequestException as e:
+        logging.error(f"Failed to download image from {url}: {e}")
+        return None
 
 # -----------------------
 # Get Images from Folder
 # -----------------------
 def get_image_files(folder_path):
-    supported_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+    """Gathers all supported image files from a given folder."""
+    supported_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
     image_files = []
     folder_path = Path(folder_path)
-    if not folder_path.exists():
+    if not folder_path.is_dir():
         logging.error(f"Folder '{folder_path}' does not exist!")
         return []
-    for extension in supported_extensions:
-        image_files.extend(glob.glob(str(folder_path / extension)))
-        image_files.extend(glob.glob(str(folder_path / extension.upper())))
-    return sorted(image_files)
+    for ext in supported_extensions:
+        image_files.extend(folder_path.glob(ext))
+        image_files.extend(folder_path.glob(ext.upper()))
+    return sorted([str(f) for f in image_files])
 
 # -----------------------
-# LoFTR Similarity Check
+# Upload to Google Lens (Optimized)
 # -----------------------
-def calculate_loftr_similarity(img1_path, img2_url, timeout=10):
+def upload_to_google_lens(driver, image_path, timeout=30):
+    """Uploads an image to Google Lens, with optimized waits."""
     try:
-        # Download image from URL
-        resp = requests.get(img2_url, timeout=timeout, headers={
-            'User-Agent': 'Mozilla/5.0'
-        })
-        img_array = np.frombuffer(resp.content, np.uint8)
-        img2 = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        abs_path = os.path.abspath(image_path)
+        driver.get("https://lens.google.com/")
         
-        if img2 is None:
-            return 0.0, 0
+        # OPTIMIZATION: Wait for the file input element to be present instead of a static sleep.
+        upload_input = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
+        )
         
-        # Use LoFTR matcher
-        similarity_score, num_matches = loftr_matcher.match_images(img1_path, img2)
-        return similarity_score, num_matches
+        upload_input.send_keys(abs_path)
+        
+        # OPTIMIZATION: Wait for results to load instead of a long static sleep.
+        # This checks for multiple possible indicators of a successful upload.
+        WebDriverWait(driver, timeout).until(
+            EC.any_of(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[data-photo-id]")),
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a[href*='imgurl=']")),
+                EC.url_contains("search")
+            )
+        )
+        logging.info("Upload successful - results detected.")
+        return True
+        
+    except TimeoutException:
+        logging.error(f"Timed out waiting for Google Lens elements for {image_path}.")
+        return False
+    except Exception as e:
+        logging.error(f"Upload to Google Lens failed for {image_path}: {e}")
+        return False
+
+# -----------------------
+# Image URL Extraction
+# -----------------------
+def get_google_image_urls(driver, max_images=50):
+    """Extracts visually similar image URLs from the Google Lens results page."""
+    urls = set()
+    try:
+        # Scroll to load more results
+        for _ in range(3):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5) # Wait for content to load after scroll
+        
+        page_source = driver.page_source
+        
+        # Use regex to find URLs in common patterns within the page source.
+        # This is often faster than finding and iterating through Selenium elements.
+        url_patterns = [
+            r'"(https?://[^"]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^"]*)?)"',
+            r"'(https?://[^']+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^']*)?)'",
+            r'"ou":"(https?://[^"]+)"',
+            r'imgurl=(https?://[^&]+)'
+        ]
+        
+        for pattern in url_patterns:
+            matches = re.findall(pattern, page_source, re.IGNORECASE)
+            for match in matches:
+                # Decode URL encoding (e.g., %2F -> /) and filter out unwanted domains
+                decoded_url = unquote(match)
+                if decoded_url.startswith('http') and not any(skip in decoded_url for skip in [
+                    'google.com', 'gstatic.com', 'googleusercontent.com', 'data:image'
+                ]):
+                    urls.add(decoded_url)
+        
+        logging.info(f"Extracted {len(urls)} potential image URLs.")
+        return list(urls)[:max_images]
         
     except Exception as e:
+        logging.error(f"Error extracting Google URLs: {e}")
+        return []
+
+# -----------------------
+# FLANN Feature Matching (Optimized)
+# -----------------------
+def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=15):
+    """
+    Calculates similarity between a pre-loaded local image and a remote image from a URL.
+    
+    Args:
+        img1_cv (numpy.ndarray): The source image pre-loaded as a grayscale numpy array.
+        img2_url (str): The URL of the image to compare against.
+    
+    Returns:
+        tuple: (similarity_score, number_of_inlier_matches)
+    """
+    try:
+        # OPTIMIZATION: The source image (img1_cv) is passed directly, avoiding repeated disk reads.
+        if img1_cv is None: 
+            return 0.0, 0
+        
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(img2_url, timeout=timeout, headers=headers)
+        if resp.status_code != 200: 
+            return 0.0, 0
+        
+        img_array = np.frombuffer(resp.content, np.uint8)
+        img2 = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+        if img2 is None: 
+            return 0.0, 0
+
+        orb = cv2.ORB_create(nfeatures=2000)
+        kp1, des1 = orb.detectAndCompute(img1_cv, None)
+        kp2, des2 = orb.detectAndCompute(img2, None)
+        if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
+            return 0.0, 0
+
+        FLANN_INDEX_LSH = 6
+        index_params = dict(algorithm=FLANN_INDEX_LSH, table_number=6, key_size=12, multi_probe_level=1)
+        search_params = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        matches = flann.knnMatch(des1, des2, k=2)
+
+        good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+        num_good_matches = len(good)
+
+        if num_good_matches > min_matches:
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if mask is not None:
+                num_inliers = np.sum(mask)
+                similarity_score = num_inliers / num_good_matches
+                return min(similarity_score, 1.0), num_inliers
+        return 0.0, 0
+    except Exception:
+        # Catch-all for any errors during processing (e.g., network, OpenCV issues)
         return 0.0, 0
 
 # -----------------------
-# Similarity Check with LoFTR
+# Process Single Image (Updated Logic)
 # -----------------------
-def is_similar_image(img1_path, img2_url, loftr_threshold=0.3, min_matches=20):
-    loftr_score, num_matches = calculate_loftr_similarity(img1_path, img2_url)
-    is_match = (loftr_score >= loftr_threshold and num_matches >= min_matches)
-    return is_match, loftr_score, num_matches
-
-# -----------------------
-# Process Single Image (Parallelized)
-# -----------------------
-def process_image(driver, image_path, max_images=40, max_workers=8, loftr_threshold=0.3, min_matches=20, log_writer=None, links_writer=None):
-    image_name = os.path.basename(image_path)
+def process_image(driver, image_path, max_urls=50, max_workers=10, log_writer=None, links_writer=None, threshold=0.1):
+    image_name = Path(image_path).name
     start_time = time.time()
     logging.info(f"Processing: {image_name}")
     
-    # Upload image and get to results page
-    success = upload_image(driver, image_path)
-    
-    if not success:
-        logging.warning(f"Failed to upload {image_name}, retrying...")
-        time.sleep(2)
-        success = upload_image(driver, image_path)
-    
-    # Extract URLs
-    urls = get_image_urls(driver, max_images=max_images)
-    
-    if not urls:
-        end_time = time.time()
-        processing_time = end_time - start_time
+    if not upload_to_google_lens(driver, image_path):
         if log_writer:
-            log_writer.writerow([image_name, f"{processing_time:.2f}", 0, "No URLs found"])
-        logging.warning(f"No URLs found for {image_name}")
-        return []
-    
-    matched_urls = []
-    def check_url(url):
-        is_match, loftr_score, num_matches = is_similar_image(
-            image_path, url, loftr_threshold=loftr_threshold, min_matches=min_matches
-        )
-        # Save image link as soon as processed
-        if links_writer:
-            links_writer.writerow([image_name, url])
-        if is_match:
-            # Download the similar image
-            downloaded_path = download_similar_image(url, image_name, loftr_score)
-            return {
-                'source_image': image_name,
-                'matched_url': url,
-                'loftr_score': loftr_score,
-                'num_matches': num_matches,
-                'downloaded_path': downloaded_path
-            }
+            log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "Google Lens upload failed"])
         return None
     
+    urls = get_google_image_urls(driver, max_images=max_urls)
+    if not urls:
+        if log_writer:
+            log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "No visually similar image URLs found"])
+        return None
+    
+    # OPTIMIZATION: Load the source image once into memory before starting comparisons.
+    source_img_cv = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if source_img_cv is None:
+        logging.error(f"Could not read source image {image_name} for processing.")
+        if log_writer:
+            log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "Failed to read source image file"])
+        return None
+
+    best_match = None
+    best_score = 0.0
+    
+    def check_url(url):
+        score, matches = calculate_flann_similarity(source_img_cv, url)
+        if links_writer:
+            links_writer.writerow([image_name, url])
+        return url, score, matches
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_url = {executor.submit(check_url, url): url for url in urls}
-        for future in as_completed(future_to_url):
-            result = future.result()
-            if result: matched_urls.append(result)
+        futures = {executor.submit(check_url, url): url for url in urls}
+        for future in as_completed(futures):
+            url, score, matches = future.result()
+            if score > best_score and score >= threshold:
+                best_score = score
+                best_match = {
+                    'source_image': image_name,
+                    'matched_url': url,
+                    'flann_score': score,
+                    'num_matches': matches
+                }
     
-    end_time = time.time()
-    processing_time = end_time - start_time
+    processing_time = time.time() - start_time
     
-    # Log the processing time
-    if log_writer:
-        log_writer.writerow([image_name, f"{processing_time:.2f}", len(matched_urls), f"Found {len(matched_urls)} matches"])
-    
-    logging.info(f"Found {len(matched_urls)} matches for {image_name} (took {processing_time:.2f}s)")
-    
-    # Move processed image to done folder concurrently
-    move_executor = ThreadPoolExecutor(max_workers=1)
-    move_executor.submit(move_image_to_done, image_path)
-    move_executor.shutdown(wait=False)
-    
-    return matched_urls
+    # LOGIC CHANGE: Only create comparison and move file if a good match was found.
+    if best_match:
+        logging.info(f"Best match found for {image_name} with score {best_match['flann_score']:.4f}")
+        comparison_path = download_and_create_comparison(
+            url=best_match['matched_url'],
+            source_image_path=image_path,
+            flann_score=best_match['flann_score'],
+            num_matches=best_match['num_matches']
+        )
+        best_match['comparison_path'] = comparison_path
+        
+        # Move the original image to 'done' folder upon successful match
+        move_image_to_done(image_path)
+        
+        if log_writer:
+            log_writer.writerow([image_name, f"{processing_time:.2f}", 1, "Match found and saved"])
+        return best_match
+    else:
+        logging.info(f"No match found for {image_name} above threshold {threshold}.")
+        if log_writer:
+            log_writer.writerow([image_name, f"{processing_time:.2f}", 0, f"No match found above threshold"])
+        return None
 
 # -----------------------
 # Save Results
 # -----------------------
-def save_results(all_matches, filename="google_matches.csv"):
+def save_results(all_matches, filename="google_best_matches.csv"):
     if not all_matches:
-        logging.info("No matches to save")
+        logging.info("No matches were found to save.")
         return
+    
+    # Filter out any None results that may have slipped through
+    all_matches = [m for m in all_matches if m is not None]
+
     with open(filename, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['Source Image', 'Matched URL', 'LoFTR Score', 'Feature Matches', 'Downloaded Path'])
+        writer.writerow(['Source Image', 'Matched URL', 'FLANN Score', 'Feature Matches', 'Comparison Image Path'])
         for match in all_matches:
             writer.writerow([
                 match['source_image'],
                 match['matched_url'],
-                f"{match['loftr_score']:.4f}",
+                f"{match['flann_score']:.4f}",
                 match['num_matches'],
-                match.get('downloaded_path', 'Failed to download')
+                match.get('comparison_path', 'N/A')
             ])
-    logging.info(f"Results saved to {filename}")
+    logging.info(f"Results for {len(all_matches)} matches saved to '{filename}'.")
 
 # -----------------------
-# Main Function (Production CLI)
+# Main Function
 # -----------------------
 def main():
-    parser = argparse.ArgumentParser(description="Google Lens LoFTR Matcher")
-    parser.add_argument('--images_folder', type=str, default='images', help='Folder containing images')
-    parser.add_argument('--output_file', type=str, default='matched_images.csv', help='CSV file for output')
-    parser.add_argument('--max_images', type=int, default=40, help='Max Google result images to check')
-    parser.add_argument('--max_workers', type=int, default=8, help='Max concurrent workers for matching')
-    parser.add_argument('--batch_delay', type=float, default=2.0, help='Delay between images (seconds)')
-    parser.add_argument('--loftr_threshold', type=float, default=0.3, help='LoFTR similarity score threshold')
-    parser.add_argument('--min_matches', type=int, default=20, help='Min LoFTR matches to consider a match')
+    parser = argparse.ArgumentParser(description="Google Lens Visual Search & FLANN Matcher")
+    parser.add_argument('-i', '--images_folder', type=str, default='images', help='Folder containing source images.')
+    parser.add_argument('-o', '--output_file', type=str, default='google_best_matches.csv', help='Output CSV file for best matches.')
+    parser.add_argument('-u', '--max_urls', type=int, default=50, help='Max Google result URLs to check per image.')
+    parser.add_argument('-w', '--max_workers', type=int, default=10, help='Max concurrent workers for downloading and matching.')
+    parser.add_argument('-d', '--delay', type=float, default=2.0, help='Delay (seconds) between processing each image.')
+    parser.add_argument('-t', '--threshold', type=float, default=0.8, help='Minimum FLANN similarity score to consider a match.')
     args = parser.parse_args()
 
-    logging.info("Starting Google Lens LoFTR Matcher (Production)")
-    
-    # Initialize LoFTR
-    init_loftr()
-    
-    # Create required folders
+    logging.info("--- Starting Google Lens Matcher ---")
     create_folders()
     
-    # Create log file for processing times
-    log_filename = f"processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    links_filename = f"google_image_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
+    # Create timestamped log files for this run
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = f"log_processing_{run_timestamp}.csv"
+    links_filename = f"log_urls_scraped_{run_timestamp}.csv"
+
     image_files = get_image_files(args.images_folder)
-    total_images = len(image_files)
-    processed_count = 0
     if not image_files:
-        logging.error(f"No images found in '{args.images_folder}'!")
+        logging.warning(f"No images found in '{args.images_folder}'. Exiting.")
         return
     
     driver = init_driver()
+    if not driver:
+        logging.critical("Failed to initialize web driver. Cannot continue.")
+        return
+        
     all_matches = []
     
     try:
-        with open(log_filename, 'w', newline='', encoding='utf-8') as log_file, open(links_filename, 'w', newline='', encoding='utf-8') as links_file:
-            log_writer = csv.writer(log_file)
-            log_writer.writerow(['Image Name', 'Processing Time (seconds)', 'Matches Found', 'Notes'])
-            links_writer = csv.writer(links_file)
-            links_writer.writerow(['Source Image', 'Matched URL'])
+        with open(log_filename, 'w', newline='', encoding='utf-8') as log_file, \
+             open(links_filename, 'w', newline='', encoding='utf-8') as links_file:
             
+            log_writer = csv.writer(log_file)
+            log_writer.writerow(['Image Name', 'Processing Time (s)', 'Match Found', 'Notes'])
+            links_writer = csv.writer(links_file)
+            links_writer.writerow(['Source Image', 'Scraped URL'])
+            
+            total_images = len(image_files)
             for idx, image_path in enumerate(image_files, 1):
-                logging.info(f"[{idx}/{total_images}] Processing: {os.path.basename(image_path)}")
-                matches = process_image(
+                logging.info(f"--- [Image {idx}/{total_images}] ---")
+                
+                match_result = process_image(
                     driver, image_path,
-                    max_images=args.max_images,
+                    max_urls=args.max_urls,
                     max_workers=args.max_workers,
-                    loftr_threshold=args.loftr_threshold,
-                    min_matches=args.min_matches,
                     log_writer=log_writer,
-                    links_writer=links_writer
+                    links_writer=links_writer,
+                    threshold=args.threshold
                 )
-                all_matches.extend(matches)
-                processed_count += 1
-                logging.info(f"Processed {processed_count} of {total_images} images.")
+                if match_result:
+                    all_matches.append(match_result)
+                
                 if idx < total_images:
-                    time.sleep(args.batch_delay)
+                    logging.info(f"Waiting for {args.delay} seconds before next image...")
+                    time.sleep(args.delay)
             
         save_results(all_matches, args.output_file)
-        logging.info(f"Processed {total_images} images, total matches: {len(all_matches)}")
-        logging.info(f"Processing log saved to {log_filename}")
-        logging.info(f"Image links saved to {links_filename}")
-        
+        logging.info(f"--- Finished ---")
+        logging.info(f"Processed {total_images} images. Found {len(all_matches)} matches.")
     except KeyboardInterrupt:
-        logging.warning("Process interrupted by user")
+        logging.warning("Process interrupted by user.")
+    except Exception as e:
+        logging.critical(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
+        # Clean up temporary chrome user data directory
+        user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", f"chrome_data_{os.getpid()}")
+        if os.path.exists(user_data_dir):
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        logging.info("Browser closed and cleanup complete.")
 
 if __name__ == "__main__":
     main()
