@@ -115,7 +115,7 @@ def create_comparison_image(source_path, similar_img_bytes, score, matches, outp
 
         # --- Add text to the top of the canvas ---
         text1 = "Original Image"
-        text2 = f"Bing| Score: {score:.4f} | Matches: {matches}"
+        text2 = f"Best Match | Score: {score:.4f} | Matches: {matches}"
         
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.8

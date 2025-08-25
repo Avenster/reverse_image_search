@@ -4,8 +4,8 @@ import cv2
 import numpy as np
 import requests
 import os
+import base64
 from pathlib import Path
-import glob
 from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import undetected_chromedriver as uc
@@ -13,590 +13,630 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
-from collections import defaultdict
 import argparse
 import logging
 import shutil
 from datetime import datetime
+import subprocess
+import platform
 
 # -----------------------
 # Logging Setup
 # -----------------------
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# -----------------------
-# Configuration
-# -----------------------
-DEFAULT_MAX_WORKERS = 8
-DEFAULT_WAIT_TIMEOUT = 15
-DEFAULT_ORB_FEATURES = 2000
-DEFAULT_ORB_MIN_MATCHES = 10
-DEFAULT_ORB_SIMILARITY_THRESHOLD = 0.01
-DEFAULT_MAX_IMAGES = 50
-DEFAULT_BATCH_DELAY = 2.0
-
-class YandexImageMatcher:
-    def __init__(
-        self,
-        images_folder='images',
-        output_file='yandex_matches.csv',
-        max_workers=DEFAULT_MAX_WORKERS,
-        max_images=DEFAULT_MAX_IMAGES,
-        orb_features=DEFAULT_ORB_FEATURES,
-        orb_min_matches=DEFAULT_ORB_MIN_MATCHES,
-        orb_similarity_threshold=DEFAULT_ORB_SIMILARITY_THRESHOLD,
-        batch_delay=DEFAULT_BATCH_DELAY
-    ):
-        self.images_folder = Path(images_folder)
-        self.output_file = output_file
-        self.driver = None
-        self.orb = cv2.ORB_create(nfeatures=orb_features, scaleFactor=1.2, nlevels=8)
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://yandex.com/',
-            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9'
-        }
-        self.max_workers = max_workers
-        self.max_images = max_images
-        self.orb_min_matches = orb_min_matches
-        self.orb_similarity_threshold = orb_similarity_threshold
-        self.batch_delay = batch_delay
-        
-        # Create required folders
-        self.create_folders()
-        
-        # Create log file for processing times
-        self.log_filename = f"yandex_processing_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        self.log_writer = None
-
-        # For saving image links concurrently
-        self.links_filename = f"yandex_image_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        self.links_file = open(self.links_filename, 'w', newline='', encoding='utf-8')
-        self.links_writer = csv.writer(self.links_file)
-        self.links_writer.writerow(['Source Image', 'Matched URL'])
-
-        # Counter for processed images
-        self.processed_count = 0
-        self.total_images = 0
-
-    def create_folders(self):
-        """Create required folders"""
-        folders = ['done', 'similar_images']
-        for folder in folders:
-            os.makedirs(folder, exist_ok=True)
-
-    def move_image_to_done(self, image_path):
-        """Move processed image to done folder"""
+def kill_chrome_processes():
+    """Kill existing Chrome processes to avoid conflicts"""
+    if platform.system() in ["Darwin", "Linux"]:
+        for process_name in ["Google Chrome", "Chromium", "chrome"]:
+            try:
+                subprocess.run(["pkill", "-f", process_name], check=False, capture_output=True)
+            except FileNotFoundError:
+                pass
+    elif platform.system() == "Windows":
         try:
-            done_folder = Path('done')
-            done_folder.mkdir(exist_ok=True)
-            
-            source = Path(image_path)
-            destination = done_folder / source.name
-            
-            # If file already exists in done folder, add timestamp
-            if destination.exists():
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                name_parts = source.stem, timestamp, source.suffix
-                destination = done_folder / f"{name_parts[0]}_{name_parts[1]}{name_parts[2]}"
-            
-            shutil.move(str(source), str(destination))
-            logging.info(f"Moved {source.name} to done folder")
-        except Exception as e:
-            logging.error(f"Failed to move {image_path} to done folder: {e}")
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], check=False, capture_output=True)
+        except FileNotFoundError:
+            pass
+    time.sleep(0.5)
 
-    def download_similar_image(self, url, source_image_name, orb_score, timeout=10):
-        """Download similar image with naming convention"""
-        try:
-            similar_folder = Path('similar_images')
-            similar_folder.mkdir(exist_ok=True)
-            
-            session = requests.Session()
-            session.headers.update(self.headers)
-            
-            response = session.get(url, timeout=timeout)
-            response.raise_for_status()
-            
-            # Extract file extension from URL or use jpg as default
-            url_parts = url.split('.')
-            extension = url_parts[-1].split('?')[0] if len(url_parts) > 1 else 'jpg'
-            if extension not in ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp']:
-                extension = 'jpg'
-            
-            # Create filename with naming convention
-            source_name = Path(source_image_name).stem
-            filename = f"{source_name}_{orb_score:.4f}.{extension}"
-            filepath = similar_folder / filename
-            
-            # If file exists, add timestamp
-            if filepath.exists():
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"{source_name}_{orb_score:.4f}_{timestamp}.{extension}"
-                filepath = similar_folder / filename
-            
-            with open(filepath, 'wb') as f:
-                f.write(response.content)
-            
-            logging.info(f"Downloaded similar image: {filename}")
-            return str(filepath)
-        except Exception as e:
-            logging.error(f"Failed to download image from {url}: {e}")
-            return None
-
-    def init_driver(self):
-        """Initialize undetected Chrome driver in headless mode for production"""
-        options = uc.ChromeOptions()
-        options.add_argument("--user-data-dir=/tmp/chrome-user-data")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-web-security")
-        options.add_argument("--disable-features=VizDisplayCompositor")
-        options.add_argument("--window-size=1920,1080")
-        # options.add_argument("--headless=new")
-        driver = uc.Chrome(options=options)
+def init_driver():
+    """Initialize undetected Chrome driver"""
+    kill_chrome_processes()
+    options = uc.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    # options.add_argument("--headless=new")  # Uncomment for headless mode
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--ignore-certificate-errors")
+    user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", f"chrome_data_{os.getpid()}")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
+    
+    try:
+        logging.info("Initializing Chrome driver...")
+        driver = uc.Chrome(options=options, version_main=None)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        driver.set_page_load_timeout(30)
+        return driver
+    except Exception as e:
+        logging.error(f"Failed to initialize Chrome driver: {e}")
+        driver = uc.Chrome(options=options, use_subprocess=True)
         return driver
 
-    def get_image_files(self):
-        """Get all image files from folder"""
-        extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
-        files = []
-        if not self.images_folder.exists():
-            raise FileNotFoundError(f"Folder '{self.images_folder}' not found")
-        for ext in extensions:
-            files.extend(glob.glob(str(self.images_folder / ext)))
-            files.extend(glob.glob(str(self.images_folder / ext.upper())))
-        return sorted(set(files))
+def create_folders():
+    """Create required folders"""
+    folders = ['done', 'similar_images']
+    for folder in folders:
+        os.makedirs(folder, exist_ok=True)
 
-    def wait_for_page_load(self):
-        """Wait for page to fully load"""
-        try:
-            WebDriverWait(self.driver, DEFAULT_WAIT_TIMEOUT).until(
-                lambda driver: driver.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(1)
-        except TimeoutException:
-            logging.warning("Page load timeout, continuing...")
-
-    def upload_to_yandex(self, image_path):
-        """Upload image to Yandex and navigate to similar images"""
-        try:
-            logging.info(f"Navigating to Yandex Images...")
-            self.driver.get("https://yandex.com/images/")
-            self.wait_for_page_load()
-            wait = WebDriverWait(self.driver, DEFAULT_WAIT_TIMEOUT)
-            file_input_selectors = [
-                "input[type='file']",
-                "input[accept*='image']",
-                ".input_type_file input",
-                ".CbirSearchForm-FileInput input"
-            ]
-            file_input = None
-            for selector in file_input_selectors:
-                try:
-                    file_input = wait.until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                    )
-                    break
-                except TimeoutException:
-                    continue
-            if not file_input:
-                logging.error("Could not find file input")
-                return False
-            abs_path = os.path.abspath(image_path)
-            self.driver.execute_script("""
-                arguments[0].style.display = 'block';
-                arguments[0].style.visibility = 'visible';
-                arguments[0].style.opacity = '1';
-                arguments[0].style.position = 'static';
-            """, file_input)
-            file_input.send_keys(abs_path)
-            logging.info(f"Uploading: {os.path.basename(image_path)}")
-            time.sleep(3)
-            try:
-                wait.until(
-                    EC.any_of(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, ".CbirNavigation-TabsItem")),
-                        EC.presence_of_element_located((By.CSS_SELECTOR, ".SerpItem")),
-                        EC.url_contains("cbir_id")
-                    )
-                )
-            except TimeoutException:
-                logging.warning("Results page didn't load properly")
-                return False
-            similar_tab_selectors = [
-                "a[data-cbir-page-type='similar']",
-                ".CbirNavigation-TabsItem_name_similar-page",
-                "a.CbirNavigation-TabsItem_name_similar-page",
-                "//a[contains(text(), 'Similar') or contains(text(), 'Похожие')]"
-            ]
-            similar_tab = None
-            for selector in similar_tab_selectors:
-                try:
-                    if selector.startswith("//"):
-                        similar_tab = wait.until(
-                            EC.element_to_be_clickable((By.XPATH, selector))
-                        )
-                    else:
-                        similar_tab = wait.until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                        )
-                    logging.info(f"Found similar tab with selector: {selector}")
-                    break
-                except TimeoutException:
-                    continue
-            if not similar_tab:
-                try:
-                    similar_tab = wait.until(
-                        EC.element_to_be_clickable((By.XPATH, "//a[contains(@class, 'CbirNavigation-TabsItem') and (contains(text(), 'Similar') or contains(text(), 'Похожие') or contains(text(), 'похожие'))]"))
-                    )
-                    logging.info("Found similar tab by text content")
-                except TimeoutException:
-                    logging.error("Could not find Similar Images tab")
-                    return False
-            try:
-                self.driver.execute_script("arguments[0].scrollIntoView(true);", similar_tab)
-                time.sleep(1)
-                try:
-                    similar_tab.click()
-                except ElementClickInterceptedException:
-                    self.driver.execute_script("arguments[0].click();", similar_tab)
-                time.sleep(3)
-                current_url = self.driver.current_url
-                if "cbir_page=similar" in current_url or "similar" in current_url.lower():
-                    logging.info("Successfully navigated to similar images")
-                    return True
-                else:
-                    logging.info(f"URL doesn't contain similar page indicator: {current_url}")
-                    return True
-            except Exception as e:
-                logging.error(f"Error clicking similar tab: {str(e)}")
-                return False
-        except Exception as e:
-            logging.error(f"Upload error: {str(e)}")
-            return False
-
-    def extract_image_urls(self, max_images):
-        """Extract image URLs from results page"""
-        urls = set()
-        logging.info("Extracting image URLs...")
-        for i in range(3):
-            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
-        time.sleep(2)
-        extracted_urls = self.driver.execute_script("""
-            var urls = new Set();
-            document.querySelectorAll('a[href*="img_url="]').forEach(link => {
-                try {
-                    var urlMatch = link.href.match(/img_url=([^&]+)/);
-                    if (urlMatch) {
-                        var decoded = decodeURIComponent(urlMatch[1]);
-                        if (decoded.startsWith('http') && !decoded.includes('yandex') && !decoded.includes('yastatic')) {
-                            urls.add(decoded);
-                        }
-                    }
-                } catch(e) {}
-            });
-            document.querySelectorAll('[data-bem*="http"]').forEach(elem => {
-                try {
-                    var bem = elem.getAttribute('data-bem') || '';
-                    var matches = bem.match(/https?:\\/\\/[^"'\\s,}]+/g) || [];
-                    matches.forEach(url => {
-                        url = url.replace(/\\\\u[\da-f]{4}/gi, '');
-                        if (!url.includes('yandex') && !url.includes('yastatic') && !url.includes('avatars.mds')) {
-                            urls.add(url);
-                        }
-                    });
-                } catch(e) {}
-            });
-            document.querySelectorAll('img[src*="http"], [data-src*="http"]').forEach(img => {
-                try {
-                    var src = img.src || img.getAttribute('data-src') || '';
-                    if (src.startsWith('http') && !src.includes('yandex') && !src.includes('yastatic')) {
-                        urls.add(src);
-                    }
-                } catch(e) {}
-            });
-            document.querySelectorAll('script, [data-state]').forEach(elem => {
-                try {
-                    var content = elem.textContent || elem.getAttribute('data-state') || '';
-                    var matches = content.match(/https?:\\/\\/[^"'\\s,}\\]]+\\.(jpg|jpeg|png|webp|gif)/gi) || [];
-                    matches.forEach(url => {
-                        url = url.replace(/\\\\?/g, '');
-                        if (!url.includes('yandex') && !url.includes('yastatic')) {
-                            urls.add(url);
-                        }
-                    });
-                } catch(e) {}
-            });
-            return Array.from(urls).slice(0, arguments[0]);
-        """, max_images)
-        for url in extracted_urls:
-            try:
-                url = unquote(url).strip()
-                if (url.startswith('http') and 
-                    not any(x in url.lower() for x in ['yandex', 'yastatic', 'data:', 'blob:', 'avatars.mds']) and
-                    any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif'])):
-                    urls.add(url)
-            except:
-                continue
-        logging.info(f"Found {len(urls)} unique image URLs")
-        return list(urls)
-
-    def calculate_orb_similarity(self, img1_path, img2_url):
-        """ORB similarity calculation, production-ready"""
-        try:
-            img1 = cv2.imread(img1_path, cv2.IMREAD_GRAYSCALE)
-            if img1 is None:
-                return 0.0, 0
-            img1 = self._resize_image(img1, 800)
-            session = requests.Session()
-            session.headers.update(self.headers)
-            resp = session.get(img2_url, timeout=15, stream=True)
-            if resp.status_code != 200:
-                return 0.0, 0
-            content = b''
-            for chunk in resp.iter_content(chunk_size=8192):
-                content += chunk
-                if len(content) > 10 * 1024 * 1024:
-                    break
-            img_array = np.frombuffer(content, np.uint8)
-            img2 = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-            if img2 is None:
-                return 0.0, 0
-            img2 = self._resize_image(img2, 800)
-            kp1, des1 = self.orb.detectAndCompute(img1, None)
-            kp2, des2 = self.orb.detectAndCompute(img2, None)
-            if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
-                return 0.0, 0
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-            matches = bf.knnMatch(des1, des2, k=2)
-            good_matches = []
-            for match_pair in matches:
-                if len(match_pair) == 2:
-                    m, n = match_pair
-                    if m.distance < 0.75 * n.distance:
-                        good_matches.append(m)
-            num_matches = len(good_matches)
-            if num_matches >= self.orb_min_matches:
-                try:
-                    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                    _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                    if mask is not None:
-                        inliers = sum(mask.ravel().tolist())
-                        if inliers >= self.orb_min_matches:
-                            score = inliers / min(len(kp1), len(kp2))
-                            return min(score, 1.0), inliers
-                except:
-                    pass
-            if num_matches > 0:
-                score = num_matches / min(len(kp1), len(kp2)) if min(len(kp1), len(kp2)) > 0 else 0
-                return min(score, 1.0), num_matches
-            return 0.0, 0
-        except Exception:
-            return 0.0, 0
-
-    def _resize_image(self, img, max_dim):
-        """Helper to resize image if needed"""
-        h, w = img.shape[:2]
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            new_w, new_h = int(w * scale), int(h * scale)
-            return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        return img
-
-    def check_similarity_parallel(self, image_path, urls):
-        """Check multiple URLs in parallel using ThreadPoolExecutor"""
-        matched_urls = []
-        image_name = os.path.basename(image_path)
-        logging.info(f"Checking {len(urls)} URLs for matches...")
+def move_image_to_done(image_path):
+    """Move processed image to done folder"""
+    try:
+        done_folder = Path('done')
+        source = Path(image_path)
+        destination = done_folder / source.name
         
-        def check_url_and_download(url):
-            orb_score, num_matches = self.calculate_orb_similarity(image_path, url)
-            logging.info(f"Score: {orb_score:.3f}, Matches: {num_matches}")
-            # Save the image link as soon as processed
-            self.links_writer.writerow([image_name, url])
-            self.links_file.flush()
-            if orb_score >= self.orb_similarity_threshold and num_matches >= self.orb_min_matches:
-                # Download the similar image
-                downloaded_path = self.download_similar_image(url, image_name, orb_score)
-                logging.info(f"✓ Match found! Score: {orb_score:.3f}, URL: {url[:60]}...")
-                return {
-                    'source_image': image_name,
-                    'matched_url': url,
-                    'orb_score': orb_score,
-                    'num_matches': num_matches,
-                    'downloaded_path': downloaded_path
-                }
+        if destination.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            destination = done_folder / f"{source.stem}_{timestamp}{source.suffix}"
+        
+        shutil.move(str(source), str(destination))
+        logging.info(f"Moved '{source.name}' to 'done' folder.")
+    except Exception as e:
+        logging.error(f"Failed to move '{image_path}': {e}")
+
+def create_comparison_image(source_path, similar_img_bytes, score, matches, output_folder='similar_images'):
+    """Create a side-by-side comparison image"""
+    try:
+        original_img = cv2.imread(source_path)
+        if original_img is None:
+            logging.error(f"Could not read source image: {source_path}")
             return None
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_url = {
-                executor.submit(check_url_and_download, url): url 
-                for url in urls
+        similar_img_np = np.frombuffer(similar_img_bytes, np.uint8)
+        similar_img = cv2.imdecode(similar_img_np, cv2.IMREAD_COLOR)
+        if similar_img is None:
+            logging.error("Could not decode downloaded similar image.")
+            return None
+        
+        # Resize images to target height
+        target_height = 600
+        original_h, original_w = original_img.shape[:2]
+        similar_h, similar_w = similar_img.shape[:2]
+        
+        original_ratio = target_height / original_h
+        original_resized = cv2.resize(original_img, (int(original_w * original_ratio), target_height))
+        
+        similar_ratio = target_height / similar_h
+        similar_resized = cv2.resize(similar_img, (int(similar_w * similar_ratio), target_height))
+        
+        # Create stitched image with text area
+        text_area_height = 80
+        total_width = original_resized.shape[1] + similar_resized.shape[1]
+        total_height = target_height + text_area_height
+        
+        stitched_image = np.full((total_height, total_width, 3), 255, dtype=np.uint8)
+        stitched_image[text_area_height:total_height, :original_resized.shape[1]] = original_resized
+        stitched_image[text_area_height:total_height, original_resized.shape[1]:] = similar_resized
+        
+        # Add text labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.8
+        font_color = (0, 0, 0)
+        thickness = 2
+        
+        text1 = "Original Image"
+        text2 = f"Yandex | Score: {score:.4f} | Matches: {matches}"
+        
+        text1_size = cv2.getTextSize(text1, font, font_scale, thickness)[0]
+        text1_x = (original_resized.shape[1] - text1_size[0]) // 2
+        text1_y = (text_area_height - text1_size[1]) // 2 + text1_size[1]
+        
+        text2_size = cv2.getTextSize(text2, font, font_scale, thickness)[0]
+        text2_x = original_resized.shape[1] + (similar_resized.shape[1] - text2_size[0]) // 2
+        text2_y = (text_area_height - text2_size[1]) // 2 + text2_size[1]
+        
+        cv2.putText(stitched_image, text1, (text1_x, text1_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        cv2.putText(stitched_image, text2, (text2_x, text2_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        
+        # Save the comparison image
+        source_name = Path(source_path).stem
+        save_folder = Path(output_folder)
+        filename = f"{source_name}_comparison_{score:.4f}.jpg"
+        filepath = save_folder / filename
+        
+        if filepath.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = save_folder / f"{source_name}_comparison_{score:.4f}_{timestamp}.jpg"
+        
+        cv2.imwrite(str(filepath), stitched_image)
+        logging.info(f"Saved comparison image: {filepath.name}")
+        return str(filepath)
+    except Exception as e:
+        logging.error(f"Failed to create comparison image for {source_path}: {e}")
+        return None
+
+def download_and_create_comparison(url, source_image_path, flann_score, num_matches, timeout=10):
+    """Download image and create comparison"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://yandex.com/'
+        }
+        response = requests.get(url, timeout=timeout, headers=headers)
+        response.raise_for_status()
+        return create_comparison_image(
+            source_path=source_image_path,
+            similar_img_bytes=response.content,
+            score=flann_score,
+            matches=num_matches
+        )
+    except requests.RequestException as e:
+        logging.error(f"Failed to download image from {url}: {e}")
+        return None
+
+def get_image_files(folder_path):
+    """Get all image files from folder"""
+    supported_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
+    image_files = []
+    folder_path = Path(folder_path)
+    
+    if not folder_path.is_dir():
+        logging.error(f"Folder '{folder_path}' does not exist!")
+        return []
+    
+    for ext in supported_extensions:
+        image_files.extend(folder_path.glob(ext))
+        image_files.extend(folder_path.glob(ext.upper()))
+    
+    return sorted([str(f) for f in image_files])
+
+def get_image_from_url_or_base64(img_url, timeout=10):
+    """Get image from URL or base64 string"""
+    try:
+        if img_url.startswith("data:image"):
+            header, b64data = img_url.split(',', 1)
+            img_bytes = base64.b64decode(b64data)
+            img_np = np.frombuffer(img_bytes, np.uint8)
+            img_cv = cv2.imdecode(img_np, cv2.IMREAD_GRAYSCALE)
+            return img_cv
+        else:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://yandex.com/'
             }
-            completed = 0
-            for future in as_completed(future_to_url):
-                completed += 1
-                try:
-                    result = future.result(timeout=30)
-                    if result:
-                        matched_urls.append(result)
-                except Exception:
-                    continue
-        logging.info("Completed similarity checking")
-        return matched_urls
+            resp = requests.get(img_url, timeout=timeout, headers=headers)
+            img_np = np.frombuffer(resp.content, np.uint8)
+            img_cv = cv2.imdecode(img_np, cv2.IMREAD_GRAYSCALE)
+            return img_cv
+    except Exception:
+        return None
 
-    def process_image(self, image_path):
-        """Process single image"""
-        image_name = os.path.basename(image_path)
-        start_time = time.time()
-        logging.info(f"[Processing] {image_name}")
+def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=15):
+    """Calculate FLANN-based similarity between two images"""
+    try:
+        if img1_cv is None:
+            return 0.0, 0
         
-        if not self.upload_to_yandex(image_path):
-            end_time = time.time()
-            processing_time = end_time - start_time
-            if self.log_writer:
-                self.log_writer.writerow([image_name, f"{processing_time:.2f}", 0, "Upload failed"])
-            logging.error("Upload failed")
-            return []
+        img2 = get_image_from_url_or_base64(img2_url, timeout=timeout)
+        if img2 is None:
+            return 0.0, 0
         
-        urls = self.extract_image_urls(self.max_images)
-        if not urls:
-            end_time = time.time()
-            processing_time = end_time - start_time
-            if self.log_writer:
-                self.log_writer.writerow([image_name, f"{processing_time:.2f}", 0, "No URLs found"])
-            logging.error("No URLs found")
-            return []
+        # Create ORB detector
+        orb = cv2.ORB_create(nfeatures=2000)
+        kp1, des1 = orb.detectAndCompute(img1_cv, None)
+        kp2, des2 = orb.detectAndCompute(img2, None)
         
-        logging.info(f"Found {len(urls)} URLs to check")
-        matches = self.check_similarity_parallel(image_path, urls)
+        if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
+            return 0.0, 0
         
-        end_time = time.time()
-        processing_time = end_time - start_time
+        # FLANN parameters for ORB
+        FLANN_INDEX_LSH = 6
+        index_params = dict(algorithm=FLANN_INDEX_LSH,
+                           table_number=6,
+                           key_size=12,
+                           multi_probe_level=1)
+        search_params = dict(checks=50)
         
-        # Log the processing time
-        if self.log_writer:
-            self.log_writer.writerow([image_name, f"{processing_time:.2f}", len(matches), f"Found {len(matches)} matches"])
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        matches = flann.knnMatch(des1, des2, k=2)
         
-        logging.info(f"{len(matches)} matches found for {image_name} (took {processing_time:.2f}s)")
+        # Apply Lowe's ratio test
+        good = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < 0.75 * n.distance:
+                    good.append(m)
         
-        # Move processed image to done folder concurrently
-        move_executor = ThreadPoolExecutor(max_workers=1)
-        move_executor.submit(self.move_image_to_done, image_path)
-        move_executor.shutdown(wait=False)
+        num_good_matches = len(good)
+        
+        if num_good_matches > min_matches:
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if mask is not None:
+                num_inliers = np.sum(mask)
+                similarity_score = num_inliers / num_good_matches
+                return min(similarity_score, 1.0), num_inliers
+        
+        return 0.0, 0
+    except Exception:
+        return 0.0, 0
 
-        # Counter for processed images
-        self.processed_count += 1
-        logging.info(f"Processed {self.processed_count} of {self.total_images} images.")
-
-        return matches
-
-    def save_results(self, all_matches):
-        """Save results to CSV"""
-        if not all_matches:
-            logging.info("No matches to save")
-            return
-        with open(self.output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Source Image', 'Matched URL', 'ORB Score', 'Feature Matches', 'Downloaded Path'])
-            for match in all_matches:
-                writer.writerow([
-                    match['source_image'],
-                    match['matched_url'],
-                    f"{match['orb_score']:.4f}",
-                    match['num_matches'],
-                    match.get('downloaded_path', 'Failed to download')
-                ])
-        logging.info(f"Results saved to {self.output_file}")
-
-    def run(self):
-        """Main execution, CLI ready"""
-        logging.info("=" * 80)
-        logging.info("YANDEX IMAGE ORB MATCHER - Production Version")
-        logging.info("=" * 80)
-        image_files = self.get_image_files()
-        self.total_images = len(image_files)
-        if not image_files:
-            logging.error("No images found in the folder!")
-            return
-        logging.info(f"Found {self.total_images} images to process")
-        self.driver = self.init_driver()
-        all_matches = []
+def upload_to_yandex_and_navigate(driver, image_path, timeout=30):
+    """Upload image to Yandex and navigate to similar images"""
+    try:
+        driver.get("https://yandex.com/images/")
+        wait = WebDriverWait(driver, timeout)
         
+        # Wait for page to load
+        time.sleep(1)
+        
+        # Find file input with multiple selectors
+        file_input_selectors = [
+            "input[type='file']",
+            "input[accept*='image']",
+            ".input_type_file input",
+            ".CbirSearchForm-FileInput input"
+        ]
+        
+        file_input = None
+        for selector in file_input_selectors:
+            try:
+                file_input = wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                )
+                break
+            except TimeoutException:
+                continue
+        
+        if not file_input:
+            logging.error("Could not find file input")
+            return False
+        
+        # Make file input visible and upload
+        abs_path = os.path.abspath(image_path)
+        driver.execute_script("""
+            arguments[0].style.display = 'block';
+            arguments[0].style.visibility = 'visible';
+            arguments[0].style.opacity = '1';
+            arguments[0].style.position = 'static';
+        """, file_input)
+        
+        file_input.send_keys(abs_path)
+        logging.info(f"Uploading: {os.path.basename(image_path)}")
+        time.sleep(0.5)
+        
+        # Wait for results to load
         try:
-            with open(self.log_filename, 'w', newline='', encoding='utf-8') as log_file:
-                self.log_writer = csv.writer(log_file)
-                self.log_writer.writerow(['Image Name', 'Processing Time (seconds)', 'Matches Found', 'Notes'])
-                
-                for idx, image_path in enumerate(image_files, 1):
-                    logging.info(f"[{idx}/{self.total_images}] Processing: {os.path.basename(image_path)}")
-                    matches = self.process_image(image_path)
-                    all_matches.extend(matches)
-                    if idx < self.total_images:
-                        time.sleep(self.batch_delay)
-                        
-            logging.info("=" * 80)
-            logging.info("RESULTS SUMMARY")
-            logging.info("=" * 80)
-            self.save_results(all_matches)
-            logging.info(f"Images processed: {self.total_images}")
-            logging.info(f"Total matches found: {len(all_matches)}")
-            logging.info(f"Processing log saved to {self.log_filename}")
-            logging.info(f"Image links saved to {self.links_filename}")
+            wait.until(
+                EC.any_of(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".CbirNavigation-TabsItem")),
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".SerpItem")),
+                    EC.url_contains("cbir_id")
+                )
+            )
+        except TimeoutException:
+            logging.warning("Results page didn't load properly")
+            return False
+        
+        # Find and click Similar images tab with multiple fallback selectors
+        similar_tab_selectors = [
+            "a[data-cbir-page-type='similar']",
+            ".CbirNavigation-TabsItem_name_similar-page",
+            "a.CbirNavigation-TabsItem_name_similar-page",
+            "//a[contains(text(), 'Similar') or contains(text(), 'Похожие')]"
+        ]
+        
+        similar_tab = None
+        for selector in similar_tab_selectors:
+            try:
+                if selector.startswith("//"):
+                    similar_tab = wait.until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                else:
+                    similar_tab = wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                logging.info(f"Found similar tab with selector: {selector}")
+                break
+            except TimeoutException:
+                continue
+        
+        # Additional fallback: Find by class and text content
+        if not similar_tab:
+            try:
+                similar_tab = wait.until(
+                    EC.element_to_be_clickable((By.XPATH, 
+                        "//a[contains(@class, 'CbirNavigation-TabsItem') and (contains(text(), 'Similar') or contains(text(), 'Похожие') or contains(text(), 'похожие'))]"))
+                )
+                logging.info("Found similar tab by text content")
+            except TimeoutException:
+                logging.error("Could not find Similar Images tab")
+                return False
+        
+        # Click the similar tab
+        try:
+            driver.execute_script("arguments[0].scrollIntoView(true);", similar_tab)
+            time.sleep(0.5)
+            try:
+                similar_tab.click()
+            except:
+                driver.execute_script("arguments[0].click();", similar_tab)
             
-            matches_by_source = defaultdict(list)
-            for match in all_matches:
-                matches_by_source[match['source_image']].append(match)
-            if matches_by_source:
-                for source, matches in matches_by_source.items():
-                    avg_score = sum(m['orb_score'] for m in matches) / len(matches)
-                    logging.info(f"{source}: {len(matches)} matches (avg score: {avg_score:.3f})")
-            logging.info("Processing complete!")
+            time.sleep(1)
             
-        except KeyboardInterrupt:
-            logging.info("Interrupted by user")
+            current_url = driver.current_url
+            if "cbir_page=similar" in current_url or "similar" in current_url.lower():
+                logging.info("Successfully navigated to similar images")
+            else:
+                logging.info(f"URL doesn't contain similar page indicator: {current_url}")
+            
+            return True
+            
         except Exception as e:
-            logging.error(f"Error: {str(e)}")
-        finally:
-            self.links_file.close()
-            if self.driver:
-                logging.info("Closing browser...")
-                self.driver.quit()
-            logging.info("Done!")
+            logging.error(f"Error clicking similar tab: {str(e)}")
+            return False
+        
+    except TimeoutException:
+        logging.error(f"Timed out waiting for Yandex elements for {image_path}.")
+        return False
+    except Exception as e:
+        logging.error(f"Upload to Yandex failed for {image_path}: {e}")
+        return False
+
+def get_yandex_image_urls(driver, max_images=20):
+    """Extract image URLs from Yandex results"""
+    urls = set()
+    
+    # Scroll to load more images
+    # for _ in range(3):
+    #     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    #     time.sleep(1.5)
+    
+    # Try multiple extraction methods
+    try:
+        # Method 1: Extract from img_url parameters
+        links = driver.find_elements(By.CSS_SELECTOR, "a[href*='img_url=']")
+        for link in links:
+            href = link.get_attribute("href")
+            if href and "img_url=" in href:
+                url_match = href.split("img_url=")[1].split("&")[0]
+                decoded_url = unquote(url_match)
+                if decoded_url.startswith("http"):
+                    urls.add(decoded_url)
+        
+        # Method 2: Extract from data attributes
+        elements = driver.find_elements(By.CSS_SELECTOR, "[data-bem*='http']")
+        for elem in elements:
+            data_bem = elem.get_attribute("data-bem")
+            if data_bem:
+                import re
+                url_pattern = r'https?://[^"\'\\s,}]+'
+                matches = re.findall(url_pattern, data_bem)
+                for url in matches:
+                    if not any(x in url for x in ['yandex', 'yastatic']):
+                        urls.add(url)
+        
+        # Method 3: Direct image sources
+        images = driver.find_elements(By.CSS_SELECTOR, "img[src]")
+        for img in images:
+            src = img.get_attribute("src")
+            if src and src.startswith("http") and not any(x in src for x in ['yandex', 'yastatic']):
+                urls.add(src)
+                
+    except Exception as e:
+        logging.warning(f"Error extracting Yandex URLs: {e}")
+    
+    logging.info(f"Extracted {len(urls)} image URLs from Yandex.")
+    return list(urls)[:max_images]
+
+def process_image(driver, image_path, max_urls=20, max_workers=10, log_writer=None, links_writer=None, threshold=0.1):
+    """Process a single image"""
+    image_name = Path(image_path).name
+    start_time = time.time()
+    logging.info(f"Processing: {image_name}")
+    
+    # Upload to Yandex
+    if not upload_to_yandex_and_navigate(driver, image_path):
+        if log_writer:
+            log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "Upload failed"])
+        return None
+    
+    # Get image URLs
+    urls = get_yandex_image_urls(driver, max_images=max_urls)
+    if not urls:
+        if log_writer:
+            log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "No image URLs found"])
+        return None
+    
+    # Load source image
+    source_img_cv = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if source_img_cv is None:
+        logging.error(f"Could not read source image {image_name}")
+        if log_writer:
+            log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "Failed to read source image"])
+        return None
+    
+    # Find best match using FLANN
+    best_match = None
+    best_score = 0.0
+    
+    def check_url(url):
+        score, matches = calculate_flann_similarity(source_img_cv, url)
+        if links_writer:
+            links_writer.writerow([image_name, url])
+        return url, score, matches
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(check_url, url): url for url in urls}
+        for future in as_completed(futures):
+            try:
+                url, score, matches = future.result()
+                if score > best_score and score >= threshold:
+                    best_score = score
+                    best_match = {
+                        'source_image': image_name,
+                        'matched_url': url,
+                        'flann_score': score,
+                        'num_matches': matches
+                    }
+            except Exception:
+                continue
+    
+    processing_time = time.time() - start_time
+    
+    if best_match:
+        logging.info(f"Best match found for {image_name} with score {best_match['flann_score']:.4f}")
+        
+        # Download and create comparison image
+        if best_match['matched_url'].startswith("data:image"):
+            header, base64_data = best_match['matched_url'].split(',', 1)
+            img_bytes = base64.b64decode(base64_data)
+            comparison_path = create_comparison_image(
+                source_path=image_path,
+                similar_img_bytes=img_bytes,
+                score=best_match['flann_score'],
+                matches=best_match['num_matches']
+            )
+        else:
+            comparison_path = download_and_create_comparison(
+                url=best_match['matched_url'],
+                source_image_path=image_path,
+                flann_score=best_match['flann_score'],
+                num_matches=best_match['num_matches']
+            )
+        
+        best_match['comparison_path'] = comparison_path
+        
+        # Move image to done folder only if match found
+        move_image_to_done(image_path)
+        
+        if log_writer:
+            log_writer.writerow([image_name, f"{processing_time:.2f}", 1, "Match found and saved"])
+        
+        return best_match
+    else:
+        logging.info(f"No match found for {image_name} above threshold {threshold}.")
+        if log_writer:
+            log_writer.writerow([image_name, f"{processing_time:.2f}", 0, f"No match above threshold"])
+        return None
+
+def save_results(all_matches, filename="yandex_best_matches.csv"):
+    """Save results to CSV"""
+    if not all_matches:
+        logging.info("No matches were found to save.")
+        return
+    
+    all_matches = [m for m in all_matches if m is not None]
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Source Image', 'Matched URL', 'FLANN Score', 'Feature Matches', 'Comparison Image Path'])
+        for match in all_matches:
+            writer.writerow([
+                match['source_image'],
+                match['matched_url'],
+                f"{match['flann_score']:.4f}",
+                match['num_matches'],
+                match.get('comparison_path', 'N/A')
+            ])
+    
+    logging.info(f"Results for {len(all_matches)} matches saved to '{filename}'.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Yandex Image ORB Matcher")
-    parser.add_argument('--images_folder', type=str, default='images', help='Folder containing images')
-    parser.add_argument('--output_file', type=str, default='yandex_matches.csv', help='CSV file for output')
-    parser.add_argument('--max_workers', type=int, default=DEFAULT_MAX_WORKERS, help='Max concurrent workers for matching')
-    parser.add_argument('--max_images', type=int, default=DEFAULT_MAX_IMAGES, help='Max Yandex result images to check')
-    parser.add_argument('--orb_features', type=int, default=DEFAULT_ORB_FEATURES, help='ORB nfeatures parameter')
-    parser.add_argument('--orb_min_matches', type=int, default=DEFAULT_ORB_MIN_MATCHES, help='Min ORB matches to consider a match')
-    parser.add_argument('--orb_similarity_threshold', type=float, default=DEFAULT_ORB_SIMILARITY_THRESHOLD, help='ORB similarity score threshold')
-    parser.add_argument('--batch_delay', type=float, default=DEFAULT_BATCH_DELAY, help='Delay between images (seconds)')
+    parser = argparse.ArgumentParser(description="Yandex Visual Search & FLANN Matcher")
+    parser.add_argument('-i', '--images_folder', type=str, default='images', help='Folder containing source images.')
+    parser.add_argument('-o', '--output_file', type=str, default='yandex_best_matches.csv', help='Output CSV file for best matches.')
+    parser.add_argument('-u', '--max_urls', type=int, default=20, help='Max Yandex result URLs to check per image.')
+    parser.add_argument('-w', '--max_workers', type=int, default=10, help='Max concurrent workers for downloading and matching.')
+    parser.add_argument('-d', '--delay', type=float, default=0.5, help='Delay (seconds) between processing each image.')
+    parser.add_argument('-t', '--threshold', type=float, default=0.85, help='Minimum FLANN similarity score to consider a match.')
+    
     args = parser.parse_args()
-
-    matcher = YandexImageMatcher(
-        images_folder=args.images_folder,
-        output_file=args.output_file,
-        max_workers=args.max_workers,
-        max_images=args.max_images,
-        orb_features=args.orb_features,
-        orb_min_matches=args.orb_min_matches,
-        orb_similarity_threshold=args.orb_similarity_threshold,
-        batch_delay=args.batch_delay
-    )
-    matcher.run()
+    
+    logging.info("--- Starting Yandex FLANN Matcher ---")
+    create_folders()
+    
+    # Create log files
+    run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = f"yandex_log_processing_{run_timestamp}.csv"
+    links_filename = f"yandex_log_urls_scraped_{run_timestamp}.csv"
+    
+    # Get image files
+    image_files = get_image_files(args.images_folder)
+    if not image_files:
+        logging.warning(f"No images found in '{args.images_folder}'. Exiting.")
+        return
+    
+    # Initialize driver
+    driver = init_driver()
+    if not driver:
+        logging.critical("Failed to initialize web driver. Cannot continue.")
+        return
+    
+    all_matches = []
+    
+    try:
+        with open(log_filename, 'w', newline='', encoding='utf-8') as log_file, \
+             open(links_filename, 'w', newline='', encoding='utf-8') as links_file:
+            
+            log_writer = csv.writer(log_file)
+            log_writer.writerow(['Image Name', 'Processing Time (s)', 'Match Found', 'Notes'])
+            
+            links_writer = csv.writer(links_file)
+            links_writer.writerow(['Source Image', 'Scraped URL'])
+            
+            total_images = len(image_files)
+            
+            for idx, image_path in enumerate(image_files, 1):
+                logging.info(f"--- [Image {idx}/{total_images}] ---")
+                
+                match_result = process_image(
+                    driver, image_path,
+                    max_urls=args.max_urls,
+                    max_workers=args.max_workers,
+                    log_writer=log_writer,
+                    links_writer=links_writer,
+                    threshold=args.threshold
+                )
+                
+                if match_result:
+                    all_matches.append(match_result)
+                
+                if idx < total_images:
+                    logging.info(f"Waiting for {args.delay} seconds before next image...")
+                    time.sleep(args.delay)
+        
+        # Save results
+        save_results(all_matches, args.output_file)
+        
+        logging.info(f"--- Finished ---")
+        logging.info(f"Processed {total_images} images. Found {len(all_matches)} matches.")
+        
+    except KeyboardInterrupt:
+        logging.warning("Process interrupted by user.")
+    except Exception as e:
+        logging.critical(f"An unexpected error occurred: {e}", exc_info=True)
+    finally:
+        if driver:
+            driver.quit()
+        
+        # Cleanup temp Chrome data
+        user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", f"chrome_data_{os.getpid()}")
+        if os.path.exists(user_data_dir):
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        
+        logging.info("Browser closed and cleanup complete.")
 
 if __name__ == "__main__":
     main()

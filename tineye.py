@@ -27,12 +27,12 @@ logging.basicConfig(
 )
 
 DEFAULT_MAX_WORKERS = 8
-DEFAULT_WAIT_TIMEOUT = 15
+DEFAULT_WAIT_TIMEOUT = 120
 DEFAULT_ORB_FEATURES = 2000
 DEFAULT_ORB_MIN_MATCHES = 10
 DEFAULT_ORB_SIMILARITY_THRESHOLD = 0.01
 DEFAULT_MAX_IMAGES = 50
-DEFAULT_BATCH_DELAY = 2.0
+DEFAULT_BATCH_DELAY = 50
 
 def init_driver():
     options = uc.ChromeOptions()
@@ -66,7 +66,14 @@ def get_image_files(folder_path):
 def upload_to_tineye(driver, image_path):
     try:
         driver.get("https://tineye.com/")
-        time.sleep(3)
+        time.sleep(10)
+        time.sleep(10)
+        time.sleep(10)
+        time.sleep(10)
+        time.sleep(10)
+        time.sleep(10)
+        time.sleep(10)
+          
         file_input = WebDriverWait(driver, DEFAULT_WAIT_TIMEOUT).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file'][name='image'], #upload-box"))
         )
