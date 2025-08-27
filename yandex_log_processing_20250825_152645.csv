@@ -1,5 +1,0 @@
-Image Name,Processing Time (s),Match Found,Notes
-image_001 (10).jpg,29.35,1,Match found and saved
-image_001 (100).jpeg,8.92,0,No match above threshold
-image_001 (101).jpeg,9.94,0,No match above threshold
-image_001 (104).jpeg,12.15,1,Match found and saved

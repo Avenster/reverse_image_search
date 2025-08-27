@@ -19,6 +19,7 @@ import shutil
 from datetime import datetime
 import subprocess
 import platform
+import urllib3
 
 # -----------------------
 # Logging Setup
@@ -27,6 +28,9 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+
+# Disable SSL warnings for speed
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def kill_chrome_processes():
     """Kill existing Chrome processes to avoid conflicts"""
@@ -162,23 +166,26 @@ def create_comparison_image(source_path, similar_img_bytes, score, matches, outp
         logging.error(f"Failed to create comparison image for {source_path}: {e}")
         return None
 
-def download_and_create_comparison(url, source_image_path, flann_score, num_matches, timeout=10):
-    """Download image and create comparison"""
+def download_and_create_comparison(url, source_image_path, flann_score, num_matches, timeout=2):
+    """Download image and create comparison - ULTRA FAST VERSION"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://yandex.com/'
         }
-        response = requests.get(url, timeout=timeout, headers=headers)
-        response.raise_for_status()
+        # Single fast request - skip SSL verification, no retries
+        response = requests.get(url, timeout=timeout, headers=headers, verify=False)
+        if response.status_code != 200:
+            return None
+            
         return create_comparison_image(
             source_path=source_image_path,
             similar_img_bytes=response.content,
             score=flann_score,
             matches=num_matches
         )
-    except requests.RequestException as e:
-        logging.error(f"Failed to download image from {url}: {e}")
+    except:
+        # Skip any problematic URL immediately
         return None
 
 def get_image_files(folder_path):
@@ -197,8 +204,8 @@ def get_image_files(folder_path):
     
     return sorted([str(f) for f in image_files])
 
-def get_image_from_url_or_base64(img_url, timeout=10):
-    """Get image from URL or base64 string"""
+def get_image_from_url_or_base64(img_url, timeout=2):
+    """Get image from URL or base64 string - ULTRA FAST VERSION"""
     try:
         if img_url.startswith("data:image"):
             header, b64data = img_url.split(',', 1)
@@ -211,15 +218,19 @@ def get_image_from_url_or_base64(img_url, timeout=10):
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Referer': 'https://yandex.com/'
             }
-            resp = requests.get(img_url, timeout=timeout, headers=headers)
+            # Single fast request - skip SSL verification
+            resp = requests.get(img_url, timeout=timeout, headers=headers, verify=False)
+            if resp.status_code != 200:
+                return None
             img_np = np.frombuffer(resp.content, np.uint8)
             img_cv = cv2.imdecode(img_np, cv2.IMREAD_GRAYSCALE)
             return img_cv
-    except Exception:
+    except:
+        # Skip any problematic URL immediately
         return None
 
-def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=15):
-    """Calculate FLANN-based similarity between two images"""
+def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=2):
+    """Calculate FLANN-based similarity between two images - ULTRA FAST VERSION"""
     try:
         if img1_cv is None:
             return 0.0, 0
@@ -268,7 +279,7 @@ def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=15):
                 return min(similarity_score, 1.0), num_inliers
         
         return 0.0, 0
-    except Exception:
+    except:
         return 0.0, 0
 
 def upload_to_yandex_and_navigate(driver, image_path, timeout=30):
@@ -440,7 +451,7 @@ def get_yandex_image_urls(driver, max_images=20):
     logging.info(f"Extracted {len(urls)} image URLs from Yandex.")
     return list(urls)[:max_images]
 
-def process_image(driver, image_path, max_urls=20, max_workers=10, log_writer=None, links_writer=None, threshold=0.1):
+def process_image(driver, image_path, max_urls=20, max_workers=10, log_writer=None, links_writer=None, threshold=0.15):
     """Process a single image"""
     image_name = Path(image_path).name
     start_time = time.time()
@@ -490,7 +501,7 @@ def process_image(driver, image_path, max_urls=20, max_workers=10, log_writer=No
                         'flann_score': score,
                         'num_matches': matches
                     }
-            except Exception:
+            except:
                 continue
     
     processing_time = time.time() - start_time
@@ -560,7 +571,7 @@ def main():
     parser.add_argument('-u', '--max_urls', type=int, default=20, help='Max Yandex result URLs to check per image.')
     parser.add_argument('-w', '--max_workers', type=int, default=10, help='Max concurrent workers for downloading and matching.')
     parser.add_argument('-d', '--delay', type=float, default=0.5, help='Delay (seconds) between processing each image.')
-    parser.add_argument('-t', '--threshold', type=float, default=0.85, help='Minimum FLANN similarity score to consider a match.')
+    parser.add_argument('-t', '--threshold', type=float, default=0.9, help='Minimum FLANN similarity score to consider a match.')
     
     args = parser.parse_args()
     
