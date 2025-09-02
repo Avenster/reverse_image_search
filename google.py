@@ -27,22 +27,22 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-def kill_chrome_processes():
-    if platform.system() in ["Darwin", "Linux"]:
-        for process_name in ["Google Chrome", "Chromium", "chrome"]:
-            try:
-                subprocess.run(["pkill", "-f", process_name], check=False, capture_output=True)
-            except FileNotFoundError:
-                pass
-    elif platform.system() == "Windows":
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], check=False, capture_output=True)
-        except FileNotFoundError:
-            pass
-    time.sleep(1)
+# def kill_chrome_processes():
+#     if platform.system() in ["Darwin", "Linux"]:
+#         for process_name in ["Google Chrome", "Chromium", "chrome"]:
+#             try:
+#                 subprocess.run(["pkill", "-f", process_name], check=False, capture_output=True)
+#             except FileNotFoundError:
+#                 pass
+#     elif platform.system() == "Windows":
+#         try:
+#             subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], check=False, capture_output=True)
+#         except FileNotFoundError:
+#             pass
+#     time.sleep(1)
 
 def init_driver():
-    kill_chrome_processes()
+    # kill_chrome_processes()
     options = uc.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
     # options.add_argument("--headless=new")  # Uncomment for headless mode
@@ -210,7 +210,7 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
 # -----------------------
 # Extract Exact Match Image URLs - MODIFIED
 # -----------------------
-def get_exact_match_image_urls(driver, max_images=50):
+def get_exact_match_image_urls(driver, max_images=40):
     urls = set()
     # Scrape normal image URLs (https...) from img[src]
     try:
@@ -233,7 +233,7 @@ def get_exact_match_image_urls(driver, max_images=50):
     try:
         for _ in range(3):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5)
+            time.sleep(1)
         page_source = driver.page_source
         url_patterns = [
             r'"(https?://[^"]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^"]*)?)"',
@@ -253,7 +253,7 @@ def get_exact_match_image_urls(driver, max_images=50):
         logging.error(f"Error extracting fallback Google URLs: {e}")
         return []
 
-def get_image_from_url_or_base64(img_url, timeout=10):
+def get_image_from_url_or_base64(img_url, timeout=5):
     if img_url.startswith("data:image"):
         header, b64data = img_url.split(',', 1)
         img_bytes = base64.b64decode(b64data)
@@ -266,7 +266,7 @@ def get_image_from_url_or_base64(img_url, timeout=10):
         img_cv = cv2.imdecode(img_np, cv2.IMREAD_GRAYSCALE)
         return img_cv
 
-def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=15):
+def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=10):
     try:
         if img1_cv is None: 
             return 0.0, 0

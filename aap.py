@@ -33,26 +33,11 @@ from selenium.common.exceptions import TimeoutException, WebDriverException, NoS
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 import urllib3
-import random
-
-
-# List of user agents
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.1; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Edg/120.0.2210.91",
-]
-
-def get_random_user_agent():
-    return random.choice(user_agents)
 
 # --- Page Configuration ---
 st.set_page_config(
     page_title="Dual Engine Visual QC Tool",
-    page_icon="",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -127,7 +112,7 @@ def download_image_from_url(url, save_path, session):
     """Download image from URL and save to specified path"""
     try:
         headers = {
-            'User-Agent': get_random_user_agent()
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         response = session.get(url, headers=headers, timeout=30, verify=False)
         response.raise_for_status()
@@ -187,10 +172,10 @@ def get_requests_session():
     adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    session.headers.update({'User-Agent': get_random_user_agent()})
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
     return session
 
-def init_driver(headless=True):
+def init_driver(headless=False):
     """Initializes a single undetected_chromedriver instance with robust options."""
     options = uc.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
@@ -201,9 +186,10 @@ def init_driver(headless=True):
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--ignore-certificate-errors")
-    options.add_argument(f"--user-agent={get_random_user_agent()}")
-    # options.add_argument("--user-data-dir=/Users/ankurkaushal/Library/Application Support/Google/Chrome")
-    options.add_argument("--profile-directory=Default")
+    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    if headless:
+        options.add_argument("--headless=new")
 
     try:
         driver = uc.Chrome(options=options, version_main=None, use_subprocess=True)
@@ -366,7 +352,7 @@ def get_image_from_url_or_base64(img_url, session, timeout=10):
             return None
     else:
         try:
-            headers = {'User-Agent': get_random_user_agent(), 'Referer': 'https://lens.google.com/'}
+            headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://lens.google.com/'}
             resp = session.get(img_url, timeout=timeout, headers=headers, verify=False)
             resp.raise_for_status()
             img_np = np.frombuffer(resp.content, np.uint8)
@@ -416,7 +402,7 @@ def create_enhanced_comparison_image(source_path, matched_url, score, matches, e
             _, base64_data = matched_url.split(',', 1)
             img_bytes = base64.b64decode(base64_data)
         else:
-            headers = {'User-Agent': get_random_user_agent(), 'Referer': f'https://www.{engine_name.lower()}.com/'}
+            headers = {'User-Agent': 'Mozilla/5.0', 'Referer': f'https://www.{engine_name.lower()}.com/'}
             resp = session.get(matched_url, headers=headers, verify=False)
             img_bytes = resp.content
 
@@ -1221,26 +1207,28 @@ def main_ui():
     # --- Sidebar ---
     with st.sidebar:
         st.header("⚙️ General Configuration")
-        batch_delay = st.slider("Delay between images (s)", 0.0, 5.0, 2.0, 0.1)
+        batch_delay = st.slider("Delay between images (s)", 0.0, 5.0, 1.0, 0.1)
         headless_mode = st.checkbox("Run in Headless Mode", value=True, help="Run browsers in the background.")
 
-        st.header("🔎  Google Lens Configuration")
-        google_max_urls = st.slider("Max Google Results", 10, 100, 30)
-        google_threshold = st.slider("Google Similarity Threshold", 0.0, 1.0, 0.30, 0.01)
+        st.divider()
+        st.header("🔵 Google Lens Configuration")
+        google_max_urls = st.slider("Max Google Results", 10, 100, 50)
+        google_threshold = st.slider("Google Similarity Threshold", 0.0, 1.0, 0.20, 0.01)
 
-        st.header("🔎  Bing Configuration")
-        bing_max_urls = st.slider("Max Bing Results", 10, 100, 30)
-        bing_threshold = st.slider("Bing Similarity Threshold", 0.0, 1.0, 0.70, 0.01)
+        st.divider()
+        st.header("🔷 Bing Configuration")
+        bing_max_urls = st.slider("Max Bing Results", 10, 100, 40)
+        bing_threshold = st.slider("Bing Similarity Threshold", 0.0, 1.0, 0.15, 0.01)
 
-        # st.divider()
-        if st.button("New Session / Clear All", use_container_width=True, type="primary"):
+        st.divider()
+        if st.button("🔄 New Session / Clear All", use_container_width=True, type="primary"):
             quit_drivers()
             if st.session_state.temp_dir and os.path.exists(st.session_state.temp_dir):
                 shutil.rmtree(st.session_state.temp_dir, ignore_errors=True)
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
-        # st.divider()
+        st.divider()
         # Quick stats
         if st.session_state.results:
             matched = len([r for r in st.session_state.results if r and r.get('status') == 'Match Found'])
@@ -1250,7 +1238,6 @@ def main_ui():
             st.metric("Matched", matched, delta=f"{matched/(len(st.session_state.results))*100:.1f}%" if st.session_state.results else "0%")
             st.metric("Unmatched", unmatched)
             st.metric("Errors", errors)
-        # st.divider()
         st.divider()
         show_logs = st.checkbox("Show Processing Logs")
 
@@ -1261,13 +1248,13 @@ def main_ui():
     }
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "Upload & Process",
-        "Image Previews",
-        "Analytics",
-        "Results Table",
-        "Reports & Export",
-        "Engine Errors",
-        "Logs"
+        "📁 UPLOAD & PROCESS",
+        "🖼️ IMAGE PREVIEWS",
+        "📊 ANALYTICS",
+        "📋 RESULTS TABLE",
+        "📄 REPORTS & EXPORT",
+        "⚠️ ENGINE ERRORS",
+        "📝 LOGS"
     ])
 
     with tab1:
