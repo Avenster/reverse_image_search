@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-UPDATED TinEye Visual Search + FLANN (Improved URL Extraction)
-
-Change Focus:
- - Replaced extract_result_image_urls() with a more robust, layout‑aware collector
-   that targets current TinEye markup: <img data-test="result-image" ... src="https://img.tineye.com/result/...">
- - Adds incremental scrolling & stabilization loop
- - Waits explicitly for first result image (unless 0 matches / too simple already handled upstream)
- - Normalizes duplicate URLs by stripping query params (e.g., ?size=160) while preserving first-seen order
- - Adds regex fallback scan of page_source for missed image result URLs
- - Configurable constants for wait and scroll behavior
-
-Other logic (upload, FLANN, comparison, CSV output) remains unchanged from the version you posted.
-"""
-
 from __future__ import annotations
 import os
 import time
@@ -64,11 +48,11 @@ REQUESTS_BACKOFF = 0.05
 
 # NEW extraction behavior constants
 RESULT_IMG_SELECTOR = "img[data-test='result-image'][src*='img.tineye.com/result/']"
-RESULT_IMG_WAIT_TIMEOUT = 25              # Max seconds to wait for at least one result image (after post-upload wait)
-RESULT_SCROLL_STEPS_MAX = 12              # Hard cap scroll attempts
-RESULT_SCROLL_INCREMENT = 0.75            # Fraction of viewport height per scroll
-RESULT_STABLE_ITERATIONS = 3              # Stop after this many loops with no new images
-RESULT_LOOP_SLEEP = (0.35, 0.6)           # Random sleep range between loops
+RESULT_IMG_WAIT_TIMEOUT = 25             
+RESULT_SCROLL_STEPS_MAX = 12             
+RESULT_SCROLL_INCREMENT = 0.75         
+RESULT_STABLE_ITERATIONS = 3            
+RESULT_LOOP_SLEEP = (0.35, 0.6)         
 REGEX_RESULT_URL = re.compile(
     r"https://img\.tineye\.com/result/[0-9a-f]{32,128}(?:-\d+)?\?size=\d+",
     re.IGNORECASE

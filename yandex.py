@@ -1,26 +1,3 @@
-#!/usr/bin/env python3
-"""
-Yandex Visual Search & FLANN Matcher (Optimized Fast Variant)
-
-Goal:
- - Keep the original functional logic (workflow, thresholding, outputs, folder moves)
- - Improve speed, robustness, and configurability for QC team use
- - Reduce unnecessary sleeps and blocking waits
- - Add early-exit style polling for result URLs
- - Centralize tunable performance constants
- - Reuse ORB detector and a tuned requests.Session
- - Avoid broad bare except blocks
- - Allow adjustable logging level
-
-Core Logic Preserved:
- - Upload -> navigate to Similar tab -> scrape candidate image URLs
- - FLANN ORB-based similarity scoring
- - Select best match above threshold
- - Create side-by-side comparison image
- - Move matched source image to 'done'
- - Log CSV outputs (processing + scraped URLs)
-"""
-
 from __future__ import annotations
 import time
 import csv
@@ -52,20 +29,20 @@ from typing import List, Optional, Tuple, Dict
 # -----------------------
 # CONFIG (Adjust as needed)
 # -----------------------
-MAX_YANDEX_URLS_POLL_SECONDS = 4.0     # Total time to attempt collecting result URLs
-YANDEX_URLS_POLL_INTERVAL = 0.35       # Poll interval for scraping URLs
-SCROLL_DURING_POLL = True              # Slight scrolling each poll
-INITIAL_POST_UPLOAD_WAIT = 0.4         # Short stabilization delay after upload
-SIMILAR_TAB_WAIT_TIMEOUT = 8           # Max seconds to locate Similar tab
-UPLOAD_NAV_TIMEOUT = 18                # Max seconds for initial navigation & result readiness
-IMAGE_FETCH_TIMEOUT = 3                # Per-image HTTP timeout (seconds)
+MAX_YANDEX_URLS_POLL_SECONDS = 4.0     
+YANDEX_URLS_POLL_INTERVAL = 0.35     
+SCROLL_DURING_POLL = True             
+INITIAL_POST_UPLOAD_WAIT = 0.4         
+SIMILAR_TAB_WAIT_TIMEOUT = 8         
+UPLOAD_NAV_TIMEOUT = 18               
+IMAGE_FETCH_TIMEOUT = 3               
 REQUESTS_POOL_SIZE = 80
 REQUESTS_RETRY_TOTAL = 1
 REQUESTS_RETRY_BACKOFF = 0.05
 ORB_NFEATURES = 2000
-FLANN_MIN_MATCHES = 8                  # Preserve original matching logic
+FLANN_MIN_MATCHES = 8                  
 LOWE_RATIO = 0.75
-THREADPOOL_OVERHEAD_CAP = 24           # Prevent too many workers overhead
+THREADPOOL_OVERHEAD_CAP = 24         
 
 # -----------------------
 # Logging Setup (overridden by --log-level)
@@ -132,7 +109,6 @@ def init_driver():
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--window-size=1920,1080")
     options.add_argument(f"--user-agent={random_user_agent()}")
-    # Dedicated temp user data dir per run
     temp_profile_dir = tempfile.mkdtemp(prefix="yandex_vs_profile_")
     options.add_argument(f"--user-data-dir={temp_profile_dir}")
 

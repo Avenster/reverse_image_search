@@ -1,0 +1,5 @@
+undetected-chromedriver
+selenium
+opencv-python
+numpy
+requests
