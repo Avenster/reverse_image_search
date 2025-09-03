@@ -27,20 +27,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# def kill_chrome_processes():
-#     if platform.system() in ["Darwin", "Linux"]:
-#         for process_name in ["Google Chrome", "Chromium", "chrome"]:
-#             try:
-#                 subprocess.run(["pkill", "-f", process_name], check=False, capture_output=True)
-#             except FileNotFoundError:
-#                 pass
-#     elif platform.system() == "Windows":
-#         try:
-#             subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], check=False, capture_output=True)
-#         except FileNotFoundError:
-#             pass
-#     time.sleep(1)
-
 def init_driver():
     # kill_chrome_processes()
     options = uc.ChromeOptions()
@@ -167,27 +153,63 @@ def get_image_files(folder_path):
         image_files.extend(folder_path.glob(ext.upper()))
     return sorted([str(f) for f in image_files])
 
+def wait_for_exact_match_result_or_no_match(driver, timeout=15):
+    """
+    Wait until either:
+      - At least one image appears in the exact matches container, OR
+      - The 'No matches for your search' message appears.
+    Returns:
+      'results' if images found,
+      'no_matches' if the no-match heading appears,
+      None if timed out.
+    """
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        # Check for no matches heading
+        try:
+            heading = driver.find_element(By.CSS_SELECTOR, ".fk90Z[role='heading']")
+            if "No matches for your search" in heading.text.strip():
+                return "no_matches"
+        except NoSuchElementException:
+            pass
+
+        # Check for any images in exact matches block
+        imgs = driver.find_elements(By.CSS_SELECTOR, "div.qR29te img[src]")
+        if imgs:
+            return "results"
+
+        time.sleep(0.5)
+    return None
+
 def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
     try:
         abs_path = os.path.abspath(image_path)
         driver.get("https://lens.google.com/")
+
         upload_input = WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='file']"))
         )
         upload_input.send_keys(abs_path)
+
+        # Wait initial load (either some results, navigation, or 'no matches')
         WebDriverWait(driver, timeout).until(
             lambda drv: drv.find_elements(By.CSS_SELECTOR, "[data-photo-id]") or
                         drv.find_elements(By.CSS_SELECTOR, "a[href*='imgurl=']") or
-                        drv.find_elements(By.CSS_SELECTOR, ".fk90Z") or
+                        drv.find_elements(By.CSS_SELECTOR, ".fk90Z[role='heading']") or
                         EC.url_contains("search")(drv)
         )
-        try:
-            no_match = driver.find_element(By.CSS_SELECTOR, ".fk90Z[role='heading']")
-            if "No matches for your search" in no_match.text:
-                logging.info("No matches found for image, skipping.")
-                return False
-        except NoSuchElementException:
-            pass
+
+        # Early detection of 'No matches' BEFORE clicking 'Exact matches'
+        # try:
+        #     no_match = driver.find_element(By.CSS_SELECTOR, ".fk90Z[role='heading']")
+        #     if "No matches for your search" in no_match.text:
+        #         logging.info("No matches found (pre Exact matches). Skipping image.")
+        #         return False
+        # except NoSuchElementException:
+        #     pass
+
+        # Try clicking 'Exact matches'
+        clicked_exact = False
         try:
             exact_btn = driver.find_element(
                 By.XPATH,
@@ -195,10 +217,21 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
             )
             if exact_btn:
                 driver.execute_script("arguments[0].click();", exact_btn)
+                clicked_exact = True
                 logging.info("Clicked 'Exact matches' button.")
-                time.sleep(1)
+                time.sleep(0.7)  # brief pause for UI transition
         except NoSuchElementException:
-            logging.info("Exact matches button not found, continuing.")
+            logging.info("Exact matches button not found. Continuing without it.")
+
+        # If we clicked the Exact matches button, explicitly wait for results or 'no matches'
+        if clicked_exact:
+            outcome = wait_for_exact_match_result_or_no_match(driver, timeout=10)
+            if outcome == "no_matches":
+                logging.info("Exact matches view reports: No matches for your search. Skipping image.")
+                return False
+            elif outcome is None:
+                logging.info("Timed out waiting for exact matches results. Proceeding (may still try fallback URLs).")
+
         return True
     except TimeoutException:
         logging.error(f"Timed out waiting for Google Lens elements for {image_path}.")
@@ -207,9 +240,6 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
         logging.error(f"Upload to Google Lens failed for {image_path}: {e}")
         return False
 
-# -----------------------
-# Extract Exact Match Image URLs - MODIFIED
-# -----------------------
 def get_exact_match_image_urls(driver, max_images=40):
     urls = set()
     # Scrape normal image URLs (https...) from img[src]
@@ -218,7 +248,6 @@ def get_exact_match_image_urls(driver, max_images=40):
         for img in normal_imgs:
             src = img.get_attribute("src")
             if src:
-                # Accept only http(s) and base64 images, skip data:image/svg+xml (sometimes present)
                 if src.startswith("http"):
                     urls.add(src)
                 elif src.startswith("data:image") and not src.startswith("data:image/svg"):
@@ -268,10 +297,10 @@ def get_image_from_url_or_base64(img_url, timeout=5):
 
 def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=10):
     try:
-        if img1_cv is None: 
+        if img1_cv is None:
             return 0.0, 0
         img2 = get_image_from_url_or_base64(img2_url, timeout=timeout)
-        if img2 is None: 
+        if img2 is None:
             return 0.0, 0
         orb = cv2.ORB_create(nfeatures=2000)
         kp1, des1 = orb.detectAndCompute(img1_cv, None)
@@ -319,11 +348,13 @@ def process_image(driver, image_path, max_urls=50, max_workers=10, log_writer=No
         return None
     best_match = None
     best_score = 0.0
+
     def check_url(url):
         score, matches = calculate_flann_similarity(source_img_cv, url)
         if links_writer:
             links_writer.writerow([image_name, url])
         return url, score, matches
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(check_url, url): url for url in urls}
         for future in as_completed(futures):
