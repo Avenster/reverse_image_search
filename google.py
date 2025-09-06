@@ -13,14 +13,13 @@ import argparse
 import logging
 import shutil
 from datetime import datetime
-import subprocess
-import platform
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+from selenium.webdriver.common.action_chains import ActionChains  # (may be used for alternative drag method)
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -28,10 +27,9 @@ logging.basicConfig(
 )
 
 def init_driver():
-    # kill_chrome_processes()
     options = uc.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
-    # options.add_argument("--headless=new")  # Uncomment for headless mode
+    # options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -154,34 +152,68 @@ def get_image_files(folder_path):
     return sorted([str(f) for f in image_files])
 
 def wait_for_exact_match_result_or_no_match(driver, timeout=15):
-    """
-    Wait until either:
-      - At least one image appears in the exact matches container, OR
-      - The 'No matches for your search' message appears.
-    Returns:
-      'results' if images found,
-      'no_matches' if the no-match heading appears,
-      None if timed out.
-    """
     end_time = time.time() + timeout
     while time.time() < end_time:
-        # Check for no matches heading
         try:
             heading = driver.find_element(By.CSS_SELECTOR, ".fk90Z[role='heading']")
             if "No matches for your search" in heading.text.strip():
                 return "no_matches"
         except NoSuchElementException:
             pass
-
-        # Check for any images in exact matches block
         imgs = driver.find_elements(By.CSS_SELECTOR, "div.qR29te img[src]")
         if imgs:
             return "results"
-
         time.sleep(0.5)
     return None
 
-def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
+def expand_lens_crop_box(driver, timeout=8):
+    """
+    Force the crop (selection) rectangle to full image: (0,0) to (100,100).
+    """
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.m8mnA[jsname='Gbvz4b']"))
+        )
+    except TimeoutException:
+        logging.info("Crop box not detected (may not be present in this session/UI variant).")
+        return
+
+    js_script = r"""
+(function(){
+  const cropBox = document.querySelector("div.m8mnA[jsname='Gbvz4b']");
+  if(!cropBox) return "no-box";
+  const setVal = (jsname, val) => {
+      const el = document.querySelector('input[jsname="'+jsname+'"]');
+      if(!el) return;
+      el.value = val;
+      el.setAttribute('value', val);
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+  };
+  // Map your four corners
+  setVal("XU2Ndd", 0);   // top-left
+  setVal("sxgBIc", 100); // top-right
+  setVal("iuIi0d", 100); // bottom-right
+  setVal("ZMP2Le", 0);   // bottom-left
+
+  // Force styles to full coverage (Google uses calc offsets with 24px handle radius)
+  cropBox.style.left   = 'calc(0% - 24px)';
+  cropBox.style.top    = 'calc(0% - 24px)';
+  cropBox.style.width  = 'calc(100% + 48px)';
+  cropBox.style.height = 'calc(100% + 48px)';
+  return "ok";
+})();
+"""
+    try:
+        result = driver.execute_script(js_script)
+        logging.info(f"Expanded Lens crop box result: {result}")
+        
+    except Exception as e:
+        logging.warning(f"JS crop expansion failed: {e}")
+        
+    time.sleep(1.85)
+
+def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30, expand_crop=True):
     try:
         abs_path = os.path.abspath(image_path)
         driver.get("https://lens.google.com/")
@@ -191,7 +223,6 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
         )
         upload_input.send_keys(abs_path)
 
-        # Wait initial load (either some results, navigation, or 'no matches')
         WebDriverWait(driver, timeout).until(
             lambda drv: drv.find_elements(By.CSS_SELECTOR, "[data-photo-id]") or
                         drv.find_elements(By.CSS_SELECTOR, "a[href*='imgurl=']") or
@@ -199,16 +230,10 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
                         EC.url_contains("search")(drv)
         )
 
-        # Early detection of 'No matches' BEFORE clicking 'Exact matches'
-        # try:
-        #     no_match = driver.find_element(By.CSS_SELECTOR, ".fk90Z[role='heading']")
-        #     if "No matches for your search" in no_match.text:
-        #         logging.info("No matches found (pre Exact matches). Skipping image.")
-        #         return False
-        # except NoSuchElementException:
-        #     pass
+        # Expand crop box (set full image) if requested
+        if expand_crop:
+            expand_lens_crop_box(driver)
 
-        # Try clicking 'Exact matches'
         clicked_exact = False
         try:
             exact_btn = driver.find_element(
@@ -219,19 +244,17 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
                 driver.execute_script("arguments[0].click();", exact_btn)
                 clicked_exact = True
                 logging.info("Clicked 'Exact matches' button.")
-                time.sleep(0.7)  # brief pause for UI transition
+                time.sleep(0.7)
         except NoSuchElementException:
             logging.info("Exact matches button not found. Continuing without it.")
 
-        # If we clicked the Exact matches button, explicitly wait for results or 'no matches'
         if clicked_exact:
             outcome = wait_for_exact_match_result_or_no_match(driver, timeout=10)
             if outcome == "no_matches":
                 logging.info("Exact matches view reports: No matches for your search. Skipping image.")
                 return False
             elif outcome is None:
-                logging.info("Timed out waiting for exact matches results. Proceeding (may still try fallback URLs).")
-
+                logging.info("Timed out waiting for exact matches results. Proceeding anyway.")
         return True
     except TimeoutException:
         logging.error(f"Timed out waiting for Google Lens elements for {image_path}.")
@@ -242,7 +265,6 @@ def upload_to_google_lens_and_click_exact_match(driver, image_path, timeout=30):
 
 def get_exact_match_image_urls(driver, max_images=40):
     urls = set()
-    # Scrape normal image URLs (https...) from img[src]
     try:
         normal_imgs = driver.find_elements(By.CSS_SELECTOR, "div.qR29te img[src]")
         for img in normal_imgs:
@@ -258,7 +280,6 @@ def get_exact_match_image_urls(driver, max_images=40):
     except Exception as e:
         logging.warning(f"Normal image extraction failed: {e}")
 
-    # Fallback to regex scraping for visually similar images (normal URLs only)
     try:
         for _ in range(3):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -326,11 +347,11 @@ def calculate_flann_similarity(img1_cv, img2_url, min_matches=8, timeout=10):
     except Exception:
         return 0.0, 0
 
-def process_image(driver, image_path, max_urls=50, max_workers=10, log_writer=None, links_writer=None, threshold=0.1):
+def process_image(driver, image_path, max_urls=50, max_workers=10, log_writer=None, links_writer=None, threshold=0.1, expand_crop=True):
     image_name = Path(image_path).name
     start_time = time.time()
     logging.info(f"Processing: {image_name}")
-    res = upload_to_google_lens_and_click_exact_match(driver, image_path)
+    res = upload_to_google_lens_and_click_exact_match(driver, image_path, expand_crop=expand_crop)
     if res is False:
         if log_writer:
             log_writer.writerow([image_name, f"{time.time() - start_time:.2f}", 0, "No exact/visual matches found (skipped)"])
@@ -423,8 +444,13 @@ def main():
     parser.add_argument('-w', '--max_workers', type=int, default=10, help='Max concurrent workers for downloading and matching.')
     parser.add_argument('-d', '--delay', type=float, default=1, help='Delay (seconds) between processing each image.')
     parser.add_argument('-t', '--threshold', type=float, default=0.2, help='Minimum FLANN similarity score to consider a match.')
+    parser.add_argument('--no-expand-crop', action='store_true', help='Do not force the Lens crop box to full image.')
     args = parser.parse_args()
+
+    expand_crop = not args.no_expand_crop
+
     logging.info("--- Starting Google Lens Matcher ---")
+    logging.info(f"Expand crop enabled: {expand_crop}")
     create_folders()
     run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_filename = f"log_processing_{run_timestamp}.csv"
@@ -454,7 +480,8 @@ def main():
                     max_workers=args.max_workers,
                     log_writer=log_writer,
                     links_writer=links_writer,
-                    threshold=args.threshold
+                    threshold=args.threshold,
+                    expand_crop=expand_crop
                 )
                 if match_result:
                     all_matches.append(match_result)
